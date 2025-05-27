@@ -212,10 +212,12 @@ def load_model(model_name: str = typer.Argument(..., help="Model name to load"))
     # If exactly one Ollama model matches, load it
     if len(matched_models) == 1:
         model_info = next(iter(matched_models.items()))
+        full_model_name = model_info[0]  # This is "provider/model:tag"
         provider, model_short, model_type, url = model_info[1]
 
-        if load_model_config(f'ollama/{model_short}', model_type, url):
-            console.print(f"[green]✓ Loaded model: {model_short} from {provider}[/green]")
+        # Use the full model name including provider prefix
+        if load_model_config(full_model_name, model_type, url):
+            console.print(f"[green]✓ Loaded model: {full_model_name}[/green]")
             return
 
     # If no Ollama matches or multiple matches, try OpenRouter
@@ -257,7 +259,7 @@ def load_model(model_name: str = typer.Argument(..., help="Model name to load"))
     # No matches found
     console.print(f"[red]✗ No models match '{model_name}'[/red]")
     console.print("[yellow]Run 'sgpt model avail' to see available models[/yellow]")
-
+    
 
 @model_app.command("status")
 def show_current_model():
