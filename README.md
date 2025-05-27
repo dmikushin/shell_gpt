@@ -10,9 +10,89 @@ pip install shell-gpt
 By default, ShellGPT uses OpenAI's API and GPT-4 model. You'll need an API key, you can generate one [here](https://beta.openai.com/account/api-keys). You will be prompted for your key which will then be stored in `~/.config/shell_gpt/.sgptrc`. OpenAI API is not free of charge, please refer to the [OpenAI pricing](https://openai.com/pricing) for more information.
 
 > [!TIP]
-> Alternatively, you can use locally hosted open source models which are available for free. To use local models, you will need to run your own LLM backend server such as [Ollama](https://github.com/ollama/ollama). To set up ShellGPT with Ollama, please follow this comprehensive [guide](https://github.com/TheR1D/shell_gpt/wiki/Ollama).
->
-> **❗️Note that ShellGPT is not optimized for local models and may not work as expected.**
+> Alternatively, you can use locally hosted open source models which are available for free. To use local models, you will need to run your own LLM backend server such as [Ollama](https://github.com/ollama/ollama). ShellGPT now includes **built-in model management** to easily switch between different providers and models.
+
+## Model Management
+
+ShellGPT includes integrated model management commands to easily switch between different AI providers and models. You can manage multiple Ollama instances and OpenRouter models through simple commands.
+
+### Configuration
+
+Create a providers configuration file at `~/.config/shell_gpt/providers.json`:
+
+```json
+{
+    "t580": {
+        "url": "http://172.17.0.1:11434",
+        "type": "ollama"
+    },
+    "muxer": {
+        "url": "http://172.17.0.1:11435", 
+        "type": "ollama"
+    },
+    "openrouter": {
+        "url": "https://openrouter.ai/api/v1",
+        "type": "openai"
+    }
+}
+```
+
+For OpenRouter access, create an API key file at `~/.openrouter/key` containing your OpenRouter API key.
+
+### Commands
+
+**List available models:**
+```shell
+# Show models from configured Ollama providers
+sgpt model avail
+
+# Include OpenRouter models (requires internet connection)
+sgpt model avail --all
+```
+
+**Load a specific model:**
+```shell
+# Load a local Ollama model with partial matching
+sgpt model load llama2
+
+# Load a specific model from a named provider
+sgpt model load t580/mistral:7b
+
+# Load an OpenRouter model
+sgpt model load anthropic/claude-3-sonnet
+```
+
+**Check current model:**
+```shell
+sgpt model status
+```
+
+### Example Workflow
+
+```shell
+# List all available models
+sgpt model avail --all
+
+# Load a local model from the t580 provider
+sgpt model load llama2:13b
+
+# Check what's currently loaded
+sgpt model status
+# → Currently using: ollama/llama2:13b
+
+# Use the loaded model
+sgpt "What is the capital of France?"
+
+# Switch to a different provider
+sgpt model load muxer/mistral
+sgpt "Explain quantum computing"
+
+# Switch to OpenRouter for a commercial model
+sgpt model load anthropic/claude-3-sonnet
+sgpt --code "Create a Python web scraper"
+```
+
+The command supports smart partial matching - if you type `llama2`, it will find and load models containing "llama2" in their name. If multiple models match, you'll see a list and need to be more specific.
 
 ## Usage
 **ShellGPT** is designed to quickly analyse and retrieve information. It's useful for straightforward requests ranging from technical configurations to general knowledge.
@@ -449,6 +529,12 @@ Possible options for `CODE_THEME`: https://pygments.org/styles/
 │ --create-role           TEXT  Create role. [default: None]                                               │
 │ --show-role             TEXT  Show role. [default: None]                                                 │
 │ --list-roles   -lr            List roles.                                                                │
+╰──────────────────────────────────────────────────────────────────────────────────────────────────────────╯
+╭─ Model Management ───────────────────────────────────────────────────────────────────────────────────────╮
+│ model avail                   List available models from configured providers.                           │
+│ model avail --all             Include OpenRouter models in the list.                                     │
+│ model load MODEL              Load a specific model for use with ShellGPT.                              │
+│ model status                  Show the currently loaded model.                                           │
 ╰──────────────────────────────────────────────────────────────────────────────────────────────────────────╯
 ```
 
