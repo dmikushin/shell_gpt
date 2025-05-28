@@ -523,6 +523,14 @@ def main(
 
 
 def entry_point() -> None:
+    # Check if args look like a prompt without a command
+    # (first arg doesn't start with - and doesn't match any command)
+    import sys
+
+    if len(sys.argv) > 1 and sys.argv[1] not in ["--install-completion", "--show-completion", "--help", "model", "main"]:
+        # Insert 'main' command before the args
+        sys.argv.insert(1, "main")
+
     app()
 
 
