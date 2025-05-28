@@ -1,26 +1,30 @@
 import os
-import json
-import subprocess
 import sys
+import json
+import requests
 from pathlib import Path
-
-# To allow users to use arrow keys in the REPL.
-import readline  # noqa: F401
+from io import StringIO
 
 import typer
-import requests
 from click import BadArgumentUsage
 from click.types import Choice
 from rich.console import Console
-from rich.table import Table
+from rich.live import Live
+from rich.text import Text
 
-from sgpt.config import cfg
-from sgpt.function import get_openai_schemas
-from sgpt.handlers.chat_handler import ChatHandler
-from sgpt.handlers.default_handler import DefaultHandler
-from sgpt.handlers.repl_handler import ReplHandler
-from sgpt.llm_functions.init_functions import install_functions as inst_funcs
-from sgpt.role import DefaultRoles, SystemRole
+# Monkey patch Console.print to handle markdown parameter
+original_print = Console.print
+
+def patched_print(self, *args, **kwargs):
+    """Patched version of Console.print that handles markdown parameter."""
+    markdown_enabled = kwargs.pop('markdown', False) 
+    if markdown_enabled and args and args[0]:
+        from rich.markdown import Markdown
+        return original_print(self, Markdown(args[0]), **kwargs)
+    return original_print(self, *args, **kwargs)
+
+Console.print = patched_print
+
 from sgpt.utils import (
     get_edited_prompt,
     get_sgpt_version,
@@ -35,253 +39,181 @@ app.add_typer(model_app, name="model")
 
 console = Console()
 
+# Default server configuration
+SERVER_URL = os.environ.get("SGPT_SERVER_URL", "http://localhost:5000")
+API_KEY = os.environ.get("SGPT_API_KEY", "default-key-change-me")
 
-def get_providers_config_path() -> Path:
-    """Get the path to the providers configuration file."""
-    return Path.home() / ".config" / "shell_gpt" / "providers.json"
-
-
-def load_providers_config() -> dict:
-    """Load providers configuration from JSON file."""
-    providers_config_path = get_providers_config_path()
-    if not providers_config_path.exists():
-        # Create default config if it doesn't exist
-        providers_config_path.parent.mkdir(parents=True, exist_ok=True)
-        default_config = {
-            "local": {
-                "type": "ollama",
-                "url": "http://localhost:11434"
-            }
-        }
-        with open(providers_config_path, 'w') as f:
-            json.dump(default_config, f, indent=2)
-        return default_config
-
-    with open(providers_config_path, 'r') as f:
-        return json.load(f)
-
-
-def list_ollama_models(name: str, provider_url: str) -> list[str]:
-    """List Ollama models from a provider."""
-    # Set the OLLAMA_HOST environment variable for each provider
-    env = os.environ.copy()
-    env["OLLAMA_HOST"] = provider_url.split("//")[1]
-
-    try:
-        output = subprocess.check_output("ollama list", shell=True, env=env).decode()
-        lines = output.split('\n')[1:]
-        ollama_models = sorted([f"{name}/{line.split()[0]}" for line in lines if line])
-        return ollama_models
-    except subprocess.CalledProcessError as e:
-        console.print(f"[red]Failed to list models from {provider_url}: {e}[/red]")
-        return []
-
-
-def get_openrouter_models() -> list[str]:
-    """Get available OpenRouter models."""
-    try:
-        response = requests.get('https://openrouter.ai/api/v1/models', timeout=10)
-        response.raise_for_status()
-        data = response.json()
-        return sorted([item['id'] for item in data['data']])
-    except Exception as e:
-        console.print(f"[red]Failed to fetch OpenRouter models: {e}[/red]")
-        return []
-
-
-def get_openrouter_api_key() -> str:
-    """Get OpenRouter API key from file."""
-    try:
-        key_path = Path.home() / ".openrouter" / "key"
-        with open(key_path, 'r') as f:
-            return f.read().strip()
-    except FileNotFoundError:
-        console.print("[red]OpenRouter API key file not found at ~/.openrouter/key[/red]")
-        sys.exit(1)
-    except Exception as e:
-        console.print(f"[red]Error reading OpenRouter API key: {e}[/red]")
-        sys.exit(1)
-
-
-def load_model_config(model: str, provider: str, url: str):
-    """Load model configuration into ShellGPT config."""
-    # Base ShellGPT configuration
-    sgptrc = {
-        "CHAT_CACHE_PATH": "/tmp/chat_cache",
-        "CACHE_PATH": "/tmp/cache",
-        "CHAT_CACHE_LENGTH": "100",
-        "CACHE_LENGTH": "100",
-        "REQUEST_TIMEOUT": "60",
-        "DEFAULT_COLOR": "magenta",
-        "ROLE_STORAGE_PATH": str(Path.home() / ".config" / "shell_gpt" / "roles"),
-        "SYSTEM_ROLES": "false",
-        "DEFAULT_EXECUTE_SHELL_CMD": "false",
-        "DISABLE_STREAMING": "false",
-        "CODE_THEME": "dracula",
-        "OPENAI_FUNCTIONS_PATH": str(Path.home() / ".config" / "shell_gpt" / "functions"),
-        "OPENAI_USE_FUNCTIONS": "false",
-        "SHOW_FUNCTIONS_OUTPUT": "false",
-        "PRETTIFY_MARKDOWN": "true",
-        "SHELL_INTERACTION": "true",
-        "OS_NAME": "auto",
-        "SHELL_NAME": "auto"
+def get_api_headers():
+    """Get API headers for authentication."""
+    return {
+        "X-API-Key": API_KEY,
+        "Content-Type": "application/json"
     }
 
-    # Provider-specific configuration
-    if provider == 'ollama':
-        config = {**sgptrc, **{
-            "API_BASE_URL": url,
-            "USE_LITELLM": "true",
-            "OPENAI_API_KEY": ""
-        }}
-    elif provider == 'openrouter':
-        config = {**sgptrc, **{
-            "API_BASE_URL": url,
-            "USE_LITELLM": "false",
-            "OPENAI_API_KEY": get_openrouter_api_key()
-        }}
-    else:
-        console.print(f"[red]Unknown provider: {provider}[/red]")
+def check_server_status():
+    """Check if the server is running."""
+    try:
+        response = requests.get(f"{SERVER_URL}/api/v1/status", timeout=5)
+        if response.status_code == 200:
+            return True
+        return False
+    except Exception:
         return False
 
-    # Set the model
-    config["DEFAULT_MODEL"] = model
-
-    # Write configuration to file
-    config_path = Path.home() / ".config" / "shell_gpt" / ".sgptrc"
-    config_path.parent.mkdir(parents=True, exist_ok=True)
-
-    with open(config_path, 'w') as f:
-        for key, value in config.items():
-            if value == '':
-                value = '""'
-            f.write(f'{key}={value}\n')
-
-    return True
-
+def stream_response(response, md=False):
+    """Handle streaming response with Rich Live display."""
+    accumulated_text = ""
+    lines_iter = response.iter_lines(decode_unicode=True)
+    
+    try:
+        with Live(console=console, refresh_per_second=10) as live:
+            for line in lines_iter:
+                if not line:
+                    continue
+                    
+                if line.startswith('data: '):
+                    try:
+                        data = json.loads(line[6:])  # Remove 'data: ' prefix
+                        token = data.get('token', '')
+                        if token:
+                            accumulated_text += token
+                            # Update the live display
+                            if md:
+                                from rich.markdown import Markdown
+                                live.update(Markdown(accumulated_text))
+                            else:
+                                live.update(Text(accumulated_text, style="white"))
+                    except json.JSONDecodeError:
+                        continue
+                elif line.startswith('event: complete'):
+                    # Get the next line which should contain the complete response
+                    try:
+                        complete_line = next(lines_iter, "")
+                        if complete_line and complete_line.startswith('data: '):
+                            complete_data = json.loads(complete_line[6:])
+                            final_response = complete_data.get('completion') or complete_data.get('response', '')
+                            # Final update with complete response
+                            if md:
+                                from rich.markdown import Markdown
+                                live.update(Markdown(final_response))
+                            else:
+                                live.update(Text(final_response, style="white"))
+                            return final_response
+                    except (StopIteration, json.JSONDecodeError):
+                        # If we can't get the complete response, return what we have
+                        break
+                elif line.startswith('event: end'):
+                    break
+                elif line.startswith('event: error'):
+                    try:
+                        error_line = next(lines_iter, "")
+                        if error_line and error_line.startswith('data: '):
+                            error_data = json.loads(error_line[6:])
+                            error_msg = error_data.get('error', 'Unknown error')
+                            live.update(Text(f"Error: {error_msg}", style="red"))
+                            return None
+                    except (StopIteration, json.JSONDecodeError):
+                        live.update(Text("Error: Unknown error occurred", style="red"))
+                        return None
+    except KeyboardInterrupt:
+        console.print("\n[yellow]Streaming interrupted by user[/yellow]")
+        return accumulated_text
+    
+    return accumulated_text
 
 @model_app.command("avail")
 def list_available_models(
     all_models: bool = typer.Option(False, "--all", help="Include OpenRouter models")
 ):
     """List available models from configured providers."""
-    providers = load_providers_config()
-
-    table = Table(title="Available Models")
-    table.add_column("Provider", style="cyan")
-    table.add_column("Model", style="green")
-    table.add_column("Type", style="yellow")
-
-    # List Ollama models
-    for name, details in providers.items():
-        if details["type"] == "ollama":
-            models = list_ollama_models(name, details["url"])
-            for model in models:
-                table.add_row(name, model.split('/', 1)[1], "Ollama")
-
-    # List OpenRouter models if requested
-    if all_models:
-        openrouter_models = get_openrouter_models()
-        for model in openrouter_models:
-            table.add_row("openrouter", model, "OpenRouter")
-
-    if table.row_count == 0:
-        console.print("[yellow]No models found. Check your provider configuration.[/yellow]")
-    else:
-        console.print(table)
-
+    if not check_server_status():
+        console.print("[red]Server is not running. Please start the server first.[/red]")
+        return
+    
+    try:
+        response = requests.get(
+            f"{SERVER_URL}/api/v1/models?all={all_models}",
+            headers=get_api_headers(),
+            timeout=30
+        )
+        response.raise_for_status()
+        data = response.json()
+        
+        from rich.table import Table
+        table = Table(title="Available Models")
+        table.add_column("Provider", style="cyan")
+        table.add_column("Model", style="green")
+        table.add_column("Type", style="yellow")
+        
+        for model in data.get("models", []):
+            table.add_row(
+                model.get("provider", ""),
+                model.get("name", ""),
+                model.get("type", "")
+            )
+        
+        if table.row_count == 0:
+            console.print("[yellow]No models found. Check your provider configuration.[/yellow]")
+        else:
+            console.print(table)
+    except Exception as e:
+        console.print(f"[red]Error: {str(e)}[/red]")
 
 @model_app.command("load")
 def load_model(model_name: str = typer.Argument(..., help="Model name to load")):
     """Load a specific model for use with ShellGPT."""
-    providers = load_providers_config()
-    matched_models = {}
-
-    # Try to find the model in Ollama providers
-    for provider, details in providers.items():
-        if details["type"] == "ollama":
-            try:
-                models = list_ollama_models(provider, details["url"])
-                for model in models:
-                    model_short = model.split('/', 1)[1]
-                    if (model_name in model) or (model_name in model_short):
-                        matched_models[model] = (provider, model_short, "ollama", details["url"])
-            except Exception as e:
-                console.print(f"[yellow]Warning: Could not list models from {provider}: {e}[/yellow]")
-
-    # If exactly one Ollama model matches, load it
-    if len(matched_models) == 1:
-        model_info = next(iter(matched_models.items()))
-        full_model_name = model_info[0]  # This is "provider/model:tag"
-        provider, model_short, model_type, url = model_info[1]
-
-        # Use the full model name including provider prefix
-        if load_model_config(full_model_name, model_type, url):
-            console.print(f"[green]✓ Loaded model: {full_model_name}[/green]")
-            return
-
-    # If no Ollama matches or multiple matches, try OpenRouter
-    if len(matched_models) == 0:
-        openrouter_models = get_openrouter_models()
-        openrouter_matches = []
-
-        for model in openrouter_models:
-            if model_name in model:
-                openrouter_matches.append(model)
-
-        # Check for exact match
-        if model_name in openrouter_matches:
-            openrouter_matches = [model_name]
-
-        if len(openrouter_matches) == 1:
-            if load_model_config(openrouter_matches[0], "openrouter", "https://openrouter.ai/api/v1"):
-                console.print(f"[green]✓ Loaded model: {openrouter_matches[0]} from OpenRouter[/green]")
-                return
-        elif len(openrouter_matches) > 1:
-            console.print(f"[yellow]Multiple OpenRouter models match '{model_name}':[/yellow]")
-            for model in openrouter_matches[:10]:  # Limit to first 10
-                console.print(f"  {model}")
-            if len(openrouter_matches) > 10:
-                console.print(f"  ... and {len(openrouter_matches) - 10} more")
-            console.print("[yellow]Please be more specific.[/yellow]")
-            return
-
-    # Handle multiple Ollama matches
-    if len(matched_models) > 1:
-        console.print(f"[yellow]Multiple models match '{model_name}':[/yellow]")
-        for model_key in list(matched_models.keys())[:10]:  # Limit to first 10
-            console.print(f"  {model_key}")
-        if len(matched_models) > 10:
-            console.print(f"  ... and {len(matched_models) - 10} more")
-        console.print("[yellow]Please be more specific.[/yellow]")
+    if not check_server_status():
+        console.print("[red]Server is not running. Please start the server first.[/red]")
         return
-
-    # No matches found
-    console.print(f"[red]✗ No models match '{model_name}'[/red]")
-    console.print("[yellow]Run 'sgpt model avail' to see available models[/yellow]")
     
+    try:
+        response = requests.post(
+            f"{SERVER_URL}/api/v1/models/load",
+            json={"model": model_name},
+            headers=get_api_headers(),
+            timeout=30
+        )
+        
+        data = response.json()
+        
+        if response.status_code == 200:
+            console.print(f"[green]✓ Loaded model: {data.get('model')}[/green]")
+        else:
+            error = data.get("error", "Unknown error")
+            console.print(f"[red]✗ {error}[/red]")
+            
+            if "matches" in data:
+                console.print("[yellow]Multiple models match your query:[/yellow]")
+                for model in data.get("matches", [])[:10]:
+                    console.print(f"  {model}")
+                if len(data.get("matches", [])) > 10:
+                    console.print(f"  ... and {len(data.get('matches', [])) - 10} more")
+                console.print("[yellow]Please be more specific.[/yellow]")
+    except Exception as e:
+        console.print(f"[red]Error: {str(e)}[/red]")
 
 @model_app.command("status")
 def show_current_model():
     """Show the currently loaded model."""
-    config_path = Path.home() / ".config" / "shell_gpt" / ".sgptrc"
-
-    if not config_path.exists():
-        console.print("[yellow]No configuration found. No model is currently loaded.[/yellow]")
+    if not check_server_status():
+        console.print("[red]Server is not running. Please start the server first.[/red]")
         return
-
+    
     try:
-        with open(config_path, 'r') as file:
-            for line in file:
-                if line.startswith('DEFAULT_MODEL='):
-                    model = line.split('=', 1)[1].strip()
-                    console.print(f"[green]Currently using: {model}[/green]")
-                    return
-
-        console.print("[yellow]DEFAULT_MODEL not found in configuration.[/yellow]")
+        response = requests.get(
+            f"{SERVER_URL}/api/v1/model/current",
+            headers=get_api_headers(),
+            timeout=10
+        )
+        
+        if response.status_code == 200:
+            data = response.json()
+            console.print(f"[green]Currently using: {data.get('model')}[/green]")
+        else:
+            data = response.json()
+            console.print(f"[yellow]{data.get('error', 'No model currently loaded')}[/yellow]")
     except Exception as e:
-        console.print(f"[red]Error reading configuration: {e}[/red]")
-
+        console.print(f"[red]Error: {str(e)}[/red]")
 
 @app.command()
 def main(
@@ -291,7 +223,7 @@ def main(
         help="The prompt to generate completions for.",
     ),
     model: str = typer.Option(
-        cfg.get("DEFAULT_MODEL"),
+        None,
         help="Large language model to use.",
     ),
     temperature: float = typer.Option(
@@ -307,7 +239,7 @@ def main(
         help="Limits highest probable tokens (words).",
     ),
     md: bool = typer.Option(
-        cfg.get("PRETTIFY_MARKDOWN") == "true",
+        True,
         help="Prettify markdown output.",
     ),
     shell: bool = typer.Option(
@@ -318,7 +250,7 @@ def main(
         rich_help_panel="Assistance Options",
     ),
     interaction: bool = typer.Option(
-        cfg.get("SHELL_INTERACTION") == "true",
+        True,
         help="Interactive mode for --shell option.",
         rich_help_panel="Assistance Options",
     ),
@@ -337,7 +269,7 @@ def main(
         rich_help_panel="Assistance Options",
     ),
     functions: bool = typer.Option(
-        cfg.get("OPENAI_USE_FUNCTIONS") == "true",
+        False,
         help="Allow function calls.",
         rich_help_panel="Assistance Options",
     ),
@@ -348,6 +280,10 @@ def main(
     cache: bool = typer.Option(
         True,
         help="Cache completion results.",
+    ),
+    stream: bool = typer.Option(
+        True,
+        help="Enable streaming output (default: True).",
     ),
     version: bool = typer.Option(
         False,
@@ -375,7 +311,6 @@ def main(
         "--list-chats",
         "-lc",
         help="List all existing chat ids.",
-        callback=ChatHandler.list_ids,
         rich_help_panel="Chat Options",
     ),
     role: str = typer.Option(
@@ -383,24 +318,11 @@ def main(
         help="System role for GPT model.",
         rich_help_panel="Role Options",
     ),
-    create_role: str = typer.Option(
-        None,
-        help="Create role.",
-        callback=SystemRole.create,
-        rich_help_panel="Role Options",
-    ),
-    show_role: str = typer.Option(
-        None,
-        help="Show role.",
-        callback=SystemRole.show,
-        rich_help_panel="Role Options",
-    ),
     list_roles: bool = typer.Option(
         False,
         "--list-roles",
         "-lr",
         help="List roles.",
-        callback=SystemRole.list,
         rich_help_panel="Role Options",
     ),
     install_integration: bool = typer.Option(
@@ -409,25 +331,17 @@ def main(
         callback=install_shell_integration,
         hidden=True,  # Hiding since should be used only once.
     ),
-    install_functions: bool = typer.Option(
-        False,
-        help="Install default functions.",
-        callback=inst_funcs,
-        hidden=True,  # Hiding since should be used only once.
-    ),
 ) -> None:
+    """ShellGPT client - sends requests to the ShellGPT server."""
+    if not check_server_status():
+        console.print("[red]Server is not running. Please start the server first.[/red]")
+        return
+    
     stdin_passed = not sys.stdin.isatty()
-
+    
     if stdin_passed:
         stdin = ""
-        # TODO: This is very hacky.
-        # In some cases, we need to pass stdin along with inputs.
-        # When we want part of stdin to be used as a init prompt,
-        # but rest of the stdin to be used as a inputs. For example:
-        # echo "hello\n__sgpt__eof__\nThis is input" | sgpt --repl temp
-        # In this case, "hello" will be used as a init prompt, and
-        # "This is input" will be used as "interactive" input to the REPL.
-        # This is useful to test REPL with some initial context.
+        # Process stdin input
         for line in sys.stdin:
             if "__sgpt__eof__" in line:
                 break
@@ -442,85 +356,277 @@ def main(
         except OSError:
             # Non-interactive shell.
             pass
-
+    
     if show_chat:
-        ChatHandler.show_messages(show_chat, md)
-
+        try:
+            response = requests.get(
+                f"{SERVER_URL}/api/v1/chats/{show_chat}",
+                headers=get_api_headers(),
+                timeout=30
+            )
+            response.raise_for_status()
+            data = response.json()
+            
+            # Format and display messages
+            for message in data.get("messages", []):
+                role = message.get("role", "")
+                content = message.get("content", "")
+                
+                if role == "user":
+                    console.print("[bold blue]You:[/bold blue]")
+                else:
+                    console.print("[bold green]Assistant:[/bold green]")
+                
+                console.print(content, style="white" if not md else None, markdown=md)
+                console.print("")
+            
+            return
+        except Exception as e:
+            console.print(f"[red]Error: {str(e)}[/red]")
+            return
+    
+    if list_chats:
+        try:
+            response = requests.get(
+                f"{SERVER_URL}/api/v1/chats",
+                headers=get_api_headers(),
+                timeout=30
+            )
+            response.raise_for_status()
+            data = response.json()
+            
+            console.print("[bold]Available chat sessions:[/bold]")
+            for chat_id in data.get("chats", []):
+                console.print(f"  {chat_id}")
+            
+            return
+        except Exception as e:
+            console.print(f"[red]Error: {str(e)}[/red]")
+            return
+    
     if sum((shell, describe_shell, code)) > 1:
         raise BadArgumentUsage(
             "Only one of --shell, --describe-shell, and --code options can be used at a time."
         )
-
+    
     if chat and repl:
         raise BadArgumentUsage("--chat and --repl options cannot be used together.")
-
+    
     if editor and stdin_passed:
         raise BadArgumentUsage("--editor option cannot be used with stdin input.")
-
+    
     if editor:
         prompt = get_edited_prompt()
-
-    role_class = (
-        DefaultRoles.check_get(shell, describe_shell, code)
-        if not role
-        else SystemRole.get(role)
-    )
-
-    function_schemas = (get_openai_schemas() or None) if functions else None
-
-    if repl:
-        # Will be in infinite loop here until user exits with Ctrl+C.
-        ReplHandler(repl, role_class, md).handle(
-            init_prompt=prompt,
-            model=model,
-            temperature=temperature,
-            top_p=top_p,
-            caching=cache,
-            functions=function_schemas,
-        )
-
-    if chat:
-        full_completion = ChatHandler(chat, role_class, md).handle(
-            prompt=prompt,
-            model=model,
-            temperature=temperature,
-            top_p=top_p,
-            caching=cache,
-            functions=function_schemas,
-        )
-    else:
-        full_completion = DefaultHandler(role_class, md).handle(
-            prompt=prompt,
-            model=model,
-            temperature=temperature,
-            top_p=top_p,
-            caching=cache,
-            functions=function_schemas,
-        )
-
-    while shell and interaction:
-        option = typer.prompt(
-            text="[E]xecute, [D]escribe, [A]bort",
-            type=Choice(("e", "d", "a", "y"), case_sensitive=False),
-            default="e" if cfg.get("DEFAULT_EXECUTE_SHELL_CMD") == "true" else "a",
-            show_choices=False,
-            show_default=False,
-        )
-        if option in ("e", "y"):
-            # "y" option is for keeping compatibility with old version.
-            run_command(full_completion)
-        elif option == "d":
-            DefaultHandler(DefaultRoles.DESCRIBE_SHELL.get_role(), md).handle(
-                full_completion,
-                model=model,
-                temperature=temperature,
-                top_p=top_p,
-                caching=cache,
-                functions=function_schemas,
+    
+    if list_roles:
+        try:
+            response = requests.get(
+                f"{SERVER_URL}/api/v1/roles",
+                headers=get_api_headers(),
+                timeout=30
             )
-            continue
-        break
-
+            response.raise_for_status()
+            data = response.json()
+            
+            console.print("[bold]Available roles:[/bold]")
+            for role_name in data.get("roles", []):
+                console.print(f"  {role_name}")
+            
+            return
+        except Exception as e:
+            console.print(f"[red]Error: {str(e)}[/red]")
+            return
+    
+    # Process REPL command
+    if repl:
+        try:
+            # Start REPL session
+            response = requests.post(
+                f"{SERVER_URL}/api/v1/repl/start",
+                json={
+                    "repl_id": repl,
+                    "prompt": prompt,
+                    "model": model,
+                    "temperature": temperature,
+                    "top_p": top_p,
+                    "md": md,
+                    "cache": cache,
+                    "functions": functions,
+                    "role": role,
+                    "stream": stream
+                },
+                headers=get_api_headers(),
+                timeout=60,
+                stream=stream
+            )
+            response.raise_for_status()
+            
+            if stream:
+                initial_response = stream_response(response, md)
+                repl_id = repl  # We sent this as the repl_id
+            else:
+                data = response.json()
+                repl_id = data.get("repl_id")
+                initial_response = data.get("response")
+                
+                if initial_response:
+                    console.print("[bold green]Assistant:[/bold green]")
+                    console.print(initial_response, style="white" if not md else None, markdown=md)
+            
+            # Start REPL loop
+            try:
+                while True:
+                    # Get user input
+                    user_input = input("\n>>> ")
+                    
+                    if user_input.lower() in ("exit", "quit", "q"):
+                        # End REPL session
+                        requests.delete(
+                            f"{SERVER_URL}/api/v1/repl/{repl_id}",
+                            headers=get_api_headers(),
+                            timeout=10
+                        )
+                        console.print("[yellow]REPL session ended.[/yellow]")
+                        break
+                    
+                    # Process user input
+                    response = requests.post(
+                        f"{SERVER_URL}/api/v1/repl/{repl_id}",
+                        json={"input": user_input, "stream": stream},
+                        headers=get_api_headers(),
+                        timeout=60,
+                        stream=stream
+                    )
+                    response.raise_for_status()
+                    
+                    # Display response
+                    console.print("[bold green]Assistant:[/bold green]")
+                    if stream:
+                        stream_response(response, md)
+                    else:
+                        data = response.json()
+                        console.print(data.get("response", ""), style="white" if not md else None, markdown=md)
+            except KeyboardInterrupt:
+                # End REPL session on Ctrl+C
+                requests.delete(
+                    f"{SERVER_URL}/api/v1/repl/{repl_id}",
+                    headers=get_api_headers(),
+                    timeout=10
+                )
+                console.print("\n[yellow]REPL session ended.[/yellow]")
+            
+            return
+        except Exception as e:
+            console.print(f"[red]Error: {str(e)}[/red]")
+            return
+    
+    # Process chat command
+    if chat:
+        try:
+            response = requests.post(
+                f"{SERVER_URL}/api/v1/chat",
+                json={
+                    "prompt": prompt,
+                    "chat_id": chat,
+                    "model": model,
+                    "temperature": temperature,
+                    "top_p": top_p,
+                    "md": md,
+                    "cache": cache,
+                    "functions": functions,
+                    "role": role,
+                    "stream": stream
+                },
+                headers=get_api_headers(),
+                timeout=60,
+                stream=stream
+            )
+            response.raise_for_status()
+            
+            if stream:
+                full_completion = stream_response(response, md)
+            else:
+                data = response.json()
+                full_completion = data.get("completion", "")
+                console.print(full_completion, style="white" if not md else None, markdown=md)
+            
+            return
+        except Exception as e:
+            console.print(f"[red]Error: {str(e)}[/red]")
+            return
+    
+    # Default command - regular completion
+    try:
+        response = requests.post(
+            f"{SERVER_URL}/api/v1/completion",
+            json={
+                "prompt": prompt,
+                "model": model,
+                "temperature": temperature,
+                "top_p": top_p,
+                "md": md,
+                "shell": shell,
+                "describe_shell": describe_shell,
+                "code": code,
+                "functions": functions,
+                "cache": cache,
+                "role": role,
+                "stream": stream
+            },
+            headers=get_api_headers(),
+            timeout=60,
+            stream=stream
+        )
+        response.raise_for_status()
+        
+        if stream:
+            full_completion = stream_response(response, md)
+        else:
+            data = response.json()
+            full_completion = data.get("completion", "")
+            console.print(full_completion, style="white" if not md else None, markdown=md)
+        
+        # Handle shell command execution
+        if shell and interaction and full_completion:
+            option = typer.prompt(
+                text="[E]xecute, [D]escribe, [A]bort",
+                type=Choice(("e", "d", "a", "y"), case_sensitive=False),
+                default="a",
+                show_choices=False,
+                show_default=False,
+            )
+            
+            if option in ("e", "y"):
+                # Run the command
+                run_command(full_completion)
+            elif option == "d":
+                # Describe the shell command
+                describe_response = requests.post(
+                    f"{SERVER_URL}/api/v1/completion",
+                    json={
+                        "prompt": full_completion,
+                        "model": model,
+                        "temperature": temperature,
+                        "top_p": top_p,
+                        "md": md,
+                        "describe_shell": True,
+                        "cache": cache,
+                        "role": "describe_shell",
+                        "stream": stream
+                    },
+                    headers=get_api_headers(),
+                    timeout=60,
+                    stream=stream
+                )
+                describe_response.raise_for_status()
+                
+                if stream:
+                    stream_response(describe_response, md)
+                else:
+                    describe_data = describe_response.json()
+                    console.print(describe_data.get("completion", ""), style="white" if not md else None, markdown=md)
+    except Exception as e:
+        console.print(f"[red]Error: {str(e)}[/red]")
 
 def entry_point() -> None:
     # Check if args look like a prompt without a command
@@ -532,7 +638,6 @@ def entry_point() -> None:
         sys.argv.insert(1, "main")
 
     app()
-
 
 if __name__ == "__main__":
     entry_point()
