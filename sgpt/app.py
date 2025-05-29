@@ -239,7 +239,7 @@ def main(
         help="Limits highest probable tokens (words).",
     ),
     md: bool = typer.Option(
-        True,
+        False,
         help="Prettify markdown output.",
     ),
     shell: bool = typer.Option(
