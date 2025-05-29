@@ -1,17 +1,15 @@
 import json
 import platform
+import sys
 from enum import Enum
 from os import getenv, pathsep
 from os.path import basename
 from pathlib import Path
 from typing import Dict, Optional
 
-import typer
-from click import BadArgumentUsage
 from distro import name as distro_name
 
 from .config import cfg
-from .utils import option_callback
 
 SHELL_ROLE = """Provide only {shell} commands for {os} without any description.
 If there is a lack of details, provide most logical solution.
@@ -76,31 +74,40 @@ class SystemRole:
     def get(cls, name: str) -> "SystemRole":
         file_path = cls.storage / f"{name}.json"
         if not file_path.exists():
-            raise BadArgumentUsage(f'Role "{name}" not found.')
+            print(f'Error: Role "{name}" not found.', file=sys.stderr)
+            sys.exit(1)
         return cls(**json.loads(file_path.read_text()))
 
     @classmethod
-    @option_callback
-    def create(cls, name: str) -> None:
-        role = typer.prompt("Enter role description")
-        role = cls(name, role)
+    def create(cls, name: str, description: str) -> None:
+        role = cls(name, description)
         role._save()
+        print(f'Role "{name}" created successfully.')
 
     @classmethod
-    @option_callback
-    def list(cls, _value: str) -> None:
+    def list(cls, standalone: bool = False) -> list:
         if not cls.storage.exists():
+            if standalone:
+                return []
             return
         # Get all files in the folder.
         files = cls.storage.glob("*")
         # Sort files by last modification time in ascending order.
+        role_names = []
         for path in sorted(files, key=lambda f: f.stat().st_mtime):
-            typer.echo(path)
+            role_name = path.stem  # Get filename without extension
+            role_names.append(role_name)
+            if not standalone:
+                print(role_name)
+        return role_names if standalone else None
 
     @classmethod
-    @option_callback
-    def show(cls, name: str) -> None:
-        typer.echo(cls.get(name).role)
+    def show(cls, name: str, standalone: bool = False) -> Optional[str]:
+        role = cls.get(name)
+        if standalone:
+            return role.role
+        print(role.role)
+        return None
 
     @classmethod
     def get_role_name(cls, initial_message: str) -> Optional[str]:
@@ -144,20 +151,20 @@ class SystemRole:
 
     def _save(self) -> None:
         if self._exists:
-            typer.confirm(
-                f'Role "{self.name}" already exists, overwrite it?',
-                abort=True,
-            )
+            response = input(f'Role "{self.name}" already exists, overwrite it? (y/N): ')
+            if response.lower() not in ('y', 'yes'):
+                print("Aborted.")
+                sys.exit(1)
 
         self.role = ROLE_TEMPLATE.format(name=self.name, role=self.role)
         self._file_path.write_text(json.dumps(self.__dict__), encoding="utf-8")
 
     def delete(self) -> None:
         if self._exists:
-            typer.confirm(
-                f'Role "{self.name}" exist, delete it?',
-                abort=True,
-            )
+            response = input(f'Role "{self.name}" exists, delete it? (y/N): ')
+            if response.lower() not in ('y', 'yes'):
+                print("Aborted.")
+                return
         self._file_path.unlink()
 
     def same_role(self, initial_message: str) -> bool:

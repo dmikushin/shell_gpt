@@ -1,10 +1,9 @@
 import os
+import sys
 from getpass import getpass
 from pathlib import Path
 from tempfile import gettempdir
 from typing import Any
-
-from click import UsageError
 
 CONFIG_FOLDER = os.path.expanduser("~/.config")
 SHELL_GPT_CONFIG_FOLDER = Path(CONFIG_FOLDER) / "shell_gpt"
@@ -85,7 +84,8 @@ class Config(dict):  # type: ignore
         # Prioritize environment variables over config file.
         value = os.getenv(key) or super().get(key)
         if not value:
-            raise UsageError(f"Missing config key: {key}")
+            print(f"Error: Missing config key: {key}", file=sys.stderr)
+            sys.exit(1)
         return value
 
 

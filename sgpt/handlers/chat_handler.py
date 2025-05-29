@@ -1,15 +1,13 @@
 import json
+import sys
 from pathlib import Path
 from typing import Any, Callable, Dict, Generator, List, Optional
 
-import typer
-from click import BadArgumentUsage
 from rich.console import Console
 from rich.markdown import Markdown
 
 from ..config import cfg
 from ..role import DefaultRoles, SystemRole
-from ..utils import option_callback
 from .handler import Handler
 
 CHAT_CACHE_LENGTH = int(cfg.get("CHAT_CACHE_LENGTH"))
@@ -79,9 +77,9 @@ class ChatSession:
         file_path = self.storage_path / chat_id
         file_path.unlink(missing_ok=True)
 
-    def get_messages(self, chat_id: str) -> List[str]:
+    def get_messages(self, chat_id: str) -> List[Dict[str, str]]:
         messages = self._read(chat_id)
-        return [f"{message['role']}: {message['content']}" for message in messages]
+        return [{"role": message['role'], "content": message['content']} for message in messages]
 
     def exists(self, chat_id: Optional[str]) -> bool:
         return bool(chat_id and bool(self._read(chat_id)))
@@ -118,49 +116,66 @@ class ChatHandler(Handler):
 
     @classmethod
     def initial_message(cls, chat_id: str) -> str:
-        chat_history = cls.chat_session.get_messages(chat_id)
-        return chat_history[0] if chat_history else ""
+        chat_history = cls.chat_session._read(chat_id)
+        return chat_history[0]['content'] if chat_history else ""
 
     @classmethod
-    @option_callback
-    def list_ids(cls, value: str) -> None:
-        # Prints all existing chat IDs to the console.
-        for chat_id in cls.chat_session.list():
-            typer.echo(chat_id)
+    def list_ids(cls, standalone: bool = False) -> Optional[List[str]]:
+        # Returns all existing chat IDs
+        chat_ids = [chat_file.name for chat_file in cls.chat_session.list()]
+        if standalone:
+            return chat_ids
+        for chat_id in chat_ids:
+            print(chat_id)
+        return None
+
+    @classmethod
+    def get_messages(cls, chat_id: str) -> List[Dict[str, str]]:
+        """Get messages for a chat session."""
+        return cls.chat_session.get_messages(chat_id)
 
     @classmethod
     def show_messages(cls, chat_id: str, markdown: bool) -> None:
         color = cfg.get("DEFAULT_COLOR")
         if "APPLY MARKDOWN" in cls.initial_message(chat_id) and markdown:
             theme = cfg.get("CODE_THEME")
-            for message in cls.chat_session.get_messages(chat_id):
-                if message.startswith("assistant:"):
-                    Console().print(Markdown(message, code_theme=theme))
+            for message in cls.chat_session._read(chat_id):
+                role = message.get("role", "")
+                content = message.get("content", "")
+                message_str = f"{role}: {content}"
+                
+                if role == "assistant":
+                    Console().print(Markdown(message_str, code_theme=theme))
                 else:
-                    typer.secho(message, fg=color)
-                typer.echo()
+                    print(f"\033[{color}m{message_str}\033[0m")  # Simple color output
+                print()
             return
 
-        for index, message in enumerate(cls.chat_session.get_messages(chat_id)):
-            running_color = color if index % 2 == 0 else "green"
-            typer.secho(message, fg=running_color)
+        for index, message in enumerate(cls.chat_session._read(chat_id)):
+            role = message.get("role", "")
+            content = message.get("content", "")
+            message_str = f"{role}: {content}"
+            
+            # Alternate colors for readability
+            if index % 2 == 0:
+                print(f"\033[{color}m{message_str}\033[0m")
+            else:
+                print(f"\033[32m{message_str}\033[0m")  # Green
 
     def validate(self) -> None:
         if self.initiated:
             chat_role_name = self.role.get_role_name(self.initial_message(self.chat_id))
             if not chat_role_name:
-                raise BadArgumentUsage(
-                    f'Could not determine chat role of "{self.chat_id}"'
-                )
+                print(f'Error: Could not determine chat role of "{self.chat_id}"', file=sys.stderr)
+                sys.exit(1)
             if self.role.name == DefaultRoles.DEFAULT.value:
                 # If user didn't pass chat mode, we will use the one that was used to initiate the chat.
                 self.role = SystemRole.get(chat_role_name)
             else:
                 if not self.is_same_role:
-                    raise BadArgumentUsage(
-                        f'Cant change chat role to "{self.role.name}" '
-                        f'since it was initiated as "{chat_role_name}" chat.'
-                    )
+                    print(f'Error: Cannot change chat role to "{self.role.name}" '
+                         f'since it was initiated as "{chat_role_name}" chat.', file=sys.stderr)
+                    sys.exit(1)
 
     def make_messages(self, prompt: str) -> List[Dict[str, str]]:
         messages = []

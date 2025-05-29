@@ -1,11 +1,9 @@
 import os
 import platform
 import shlex
+import sys
 from tempfile import NamedTemporaryFile
 from typing import Any, Callable
-
-import typer
-from click import BadParameter, UsageError
 
 from sgpt.__version__ import __version__
 from sgpt.integration import bash_integration, zsh_integration
@@ -29,7 +27,8 @@ def get_edited_prompt() -> str:
         output = file.read()
     os.remove(file_path)
     if not output:
-        raise BadParameter("Couldn't get valid PROMPT from $EDITOR")
+        print("Error: Couldn't get valid PROMPT from $EDITOR", file=sys.stderr)
+        sys.exit(1)
     return output
 
 
@@ -53,18 +52,7 @@ def run_command(command: str) -> None:
     os.system(full_command)
 
 
-def option_callback(func: Callable) -> Callable:  # type: ignore
-    def wrapper(cls: Any, value: str) -> None:
-        if not value:
-            return
-        func(cls, value)
-        raise typer.Exit()
-
-    return wrapper
-
-
-@option_callback
-def install_shell_integration(*_args: Any) -> None:
+def install_shell_integration() -> None:
     """
     Installs shell integration. Currently only supports ZSH and Bash.
     Allows user to get shell completions in terminal by using hotkey.
@@ -74,22 +62,24 @@ def install_shell_integration(*_args: Any) -> None:
     # TODO: Implement updates.
     shell = os.getenv("SHELL", "")
     if "zsh" in shell:
-        typer.echo("Installing ZSH integration...")
+        print("Installing ZSH integration...")
         with open(os.path.expanduser("~/.zshrc"), "a", encoding="utf-8") as file:
             file.write(zsh_integration)
     elif "bash" in shell:
-        typer.echo("Installing Bash integration...")
+        print("Installing Bash integration...")
         with open(os.path.expanduser("~/.bashrc"), "a", encoding="utf-8") as file:
             file.write(bash_integration)
     else:
-        raise UsageError("ShellGPT integrations only available for ZSH and Bash.")
+        print("Error: ShellGPT integrations only available for ZSH and Bash.", file=sys.stderr)
+        sys.exit(1)
 
-    typer.echo("Done! Restart your shell to apply changes.")
+    print("Done! Restart your shell to apply changes.")
+    sys.exit(0)
 
 
-@option_callback
-def get_sgpt_version(*_args: Any) -> None:
+def get_sgpt_version() -> None:
     """
     Displays the current installed version of ShellGPT
     """
-    typer.echo(f"ShellGPT {__version__}")
+    print(f"ShellGPT {__version__}")
+    sys.exit(0)

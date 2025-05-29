@@ -1,6 +1,6 @@
 from typing import Any
+import sys
 
-import typer
 from rich import print as rich_print
 from rich.rule import Rule
 
@@ -17,8 +17,14 @@ class ReplHandler(ChatHandler):
     @classmethod
     def _get_multiline_input(cls) -> str:
         multiline_input = ""
-        while (user_input := typer.prompt("...", prompt_suffix="")) != '"""':
-            multiline_input += user_input + "\n"
+        while True:
+            try:
+                user_input = input("...")
+                if user_input == '"""':
+                    break
+                multiline_input += user_input + "\n"
+            except (EOFError, KeyboardInterrupt):
+                break
         return multiline_input
 
     def handle(self, init_prompt: str, **kwargs: Any) -> None:  # type: ignore
@@ -35,28 +41,34 @@ class ReplHandler(ChatHandler):
                 "or [d] to describe the commands, press Ctrl+C to exit."
             )
         )
-        typer.secho(info_message, fg="yellow")
+        print(f"\033[33m{info_message}\033[0m")  # Yellow text
 
         if init_prompt:
             rich_print(Rule(title="Input", style="bold purple"))
-            typer.echo(init_prompt)
+            print(init_prompt)
             rich_print(Rule(style="bold purple"))
 
         full_completion = ""
         while True:
             # Infinite loop until user exits with Ctrl+C.
-            prompt = typer.prompt(">>>", prompt_suffix=" ")
+            try:
+                prompt = input(">>> ")
+            except (EOFError, KeyboardInterrupt):
+                print("\nExiting REPL...")
+                sys.exit(0)
+                
             if prompt == '"""':
                 prompt = self._get_multiline_input()
-            if prompt == "exit()":
-                raise typer.Exit()
+            if prompt in ("exit()", "exit", "quit", "q"):
+                print("Exiting REPL...")
+                sys.exit(0)
             if init_prompt:
                 prompt = f"{init_prompt}\n\n\n{prompt}"
                 init_prompt = ""
             if self.role.name == DefaultRoles.SHELL.value and prompt == "e":
-                typer.echo()
+                print()
                 run_command(full_completion)
-                typer.echo()
+                print()
                 rich_print(Rule(style="bold magenta"))
             elif self.role.name == DefaultRoles.SHELL.value and prompt == "d":
                 DefaultHandler(

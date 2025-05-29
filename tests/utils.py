@@ -1,17 +1,13 @@
+import subprocess
+import sys
 from datetime import datetime
+from typing import List
 
-import typer
 from openai.types.chat.chat_completion_chunk import ChatCompletionChunk
 from openai.types.chat.chat_completion_chunk import Choice as StreamChoice
 from openai.types.chat.chat_completion_chunk import ChoiceDelta
-from typer.testing import CliRunner
 
-from sgpt import main
 from sgpt.config import cfg
-
-runner = CliRunner()
-app = typer.Typer()
-app.command()(main)
 
 
 def mock_comp(tokens_string):
@@ -33,19 +29,43 @@ def mock_comp(tokens_string):
     ]
 
 
-def cmd_args(prompt="", **kwargs):
-    arguments = [prompt]
+def run_sgpt_command(args: List[str], input_text: str = None) -> subprocess.CompletedProcess:
+    """Run sgpt command with given arguments and return the result."""
+    cmd = [sys.executable, "-m", "sgpt"] + args
+    
+    result = subprocess.run(
+        cmd,
+        input=input_text,
+        text=True,
+        capture_output=True,
+        timeout=30
+    )
+    
+    return result
+
+
+def cmd_args(prompt="", **kwargs) -> List[str]:
+    """Convert keyword arguments to command line arguments."""
+    arguments = []
+    
+    # Add prompt if provided
+    if prompt:
+        arguments.append(prompt)
+    
+    # Convert kwargs to command line arguments
     for key, value in kwargs.items():
         arguments.append(key)
         if isinstance(value, bool):
             continue
-        arguments.append(value)
-    arguments.append("--no-cache")
-    arguments.append("--no-functions")
+        arguments.append(str(value))
+    
+    # Add default test arguments
+    arguments.extend(["--no-cache", "--no-functions"])
     return arguments
 
 
 def comp_args(role, prompt, **kwargs):
+    """Create completion arguments for testing."""
     return {
         "messages": [
             {"role": "system", "content": role.role},

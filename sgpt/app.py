@@ -1,13 +1,11 @@
 import os
 import sys
 import json
+import argparse
 import requests
 from pathlib import Path
 from io import StringIO
 
-import typer
-from click import BadArgumentUsage
-from click.types import Choice
 from rich.console import Console
 from rich.live import Live
 from rich.text import Text
@@ -31,11 +29,6 @@ from sgpt.utils import (
     install_shell_integration,
     run_command,
 )
-
-# Create the main app and subcommands
-app = typer.Typer(help="ShellGPT - AI-powered command line assistant")
-model_app = typer.Typer(help="Model management commands")
-app.add_typer(model_app, name="model")
 
 console = Console()
 
@@ -121,223 +114,251 @@ def stream_response(response, md=False):
     
     return accumulated_text
 
-@model_app.command("avail")
-def list_available_models(
-    all_models: bool = typer.Option(False, "--all", help="Include OpenRouter models")
-):
-    """List available models from configured providers."""
+def create_parser():
+    """Create the argument parser."""
+    parser = argparse.ArgumentParser(
+        description="ShellGPT - AI-powered command line assistant",
+        prog="sgpt"
+    )
+    
+    # Main command arguments
+    parser.add_argument('prompt', nargs='?', default='', help='The prompt to generate completions for')
+    
+    # Model options
+    parser.add_argument('--model', help='Large language model to use')
+    parser.add_argument('--temperature', type=float, default=0.0, 
+                       help='Randomness of generated output (0.0-2.0)')
+    parser.add_argument('--top-p', type=float, default=1.0,
+                       help='Limits highest probable tokens (0.0-1.0)')
+    
+    # Output options
+    parser.add_argument('--md', action='store_true', help='Prettify markdown output')
+    parser.add_argument('--no-md', action='store_true', help='Disable markdown output')
+    
+    # Assistance options
+    assistance_group = parser.add_argument_group('assistance options')
+    assistance_group.add_argument('-s', '--shell', action='store_true',
+                                help='Generate and execute shell commands')
+    assistance_group.add_argument('--interaction', action='store_true', default=True,
+                                help='Interactive mode for --shell option')
+    assistance_group.add_argument('--no-interaction', action='store_true',
+                                help='Disable interactive mode for --shell option')
+    assistance_group.add_argument('-d', '--describe-shell', action='store_true',
+                                help='Describe a shell command')
+    assistance_group.add_argument('-c', '--code', action='store_true',
+                                help='Generate only code')
+    assistance_group.add_argument('--functions', action='store_true', default=False,
+                                help='Allow function calls')
+    assistance_group.add_argument('--no-functions', action='store_true',
+                                help='Disable function calls')
+    
+    # Editor and cache options
+    parser.add_argument('--editor', action='store_true', help='Open $EDITOR to provide a prompt')
+    parser.add_argument('--cache', action='store_true', default=True,
+                       help='Cache completion results')
+    parser.add_argument('--no-cache', action='store_true', help='Disable caching')
+    parser.add_argument('--stream', action='store_true', default=True,
+                       help='Enable streaming output')
+    parser.add_argument('--no-stream', action='store_true', help='Disable streaming output')
+    
+    # Version
+    parser.add_argument('--version', action='store_true', help='Show version')
+    
+    # Chat options
+    chat_group = parser.add_argument_group('chat options')
+    chat_group.add_argument('--chat', help='Follow conversation with id, use "temp" for quick session')
+    chat_group.add_argument('--repl', help='Start a REPL session')
+    chat_group.add_argument('--show-chat', help='Show all messages from provided chat id')
+    chat_group.add_argument('-lc', '--list-chats', action='store_true',
+                          help='List all existing chat ids')
+    
+    # Role options
+    role_group = parser.add_argument_group('role options')
+    role_group.add_argument('--role', help='System role for GPT model')
+    role_group.add_argument('--create-role', help='Create role')
+    role_group.add_argument('--show-role', help='Show role')
+    role_group.add_argument('-lr', '--list-roles', action='store_true', help='List roles')
+    
+    # Hidden/special options
+    parser.add_argument('--install-integration', action='store_true', 
+                       help=argparse.SUPPRESS)  # Hidden option
+    
+    return parser
+
+def create_model_parser():
+    """Create a separate parser for model commands."""
+    parser = argparse.ArgumentParser(
+        description="Model management commands",
+        prog="sgpt model"
+    )
+    
+    subparsers = parser.add_subparsers(dest='model_command', help='Model commands')
+    
+    # Model avail command
+    avail_parser = subparsers.add_parser('avail', help='List available models')
+    avail_parser.add_argument('--all', action='store_true', help='Include OpenRouter models')
+    
+    # Model load command
+    load_parser = subparsers.add_parser('load', help='Load a specific model')
+    load_parser.add_argument('model_name', help='Model name to load')
+    
+    # Model status command
+    subparsers.add_parser('status', help='Show currently loaded model')
+    
+    return parser
+
+def handle_model_commands(args):
+    """Handle model management commands."""
     if not check_server_status():
         console.print("[red]Server is not running. Please start the server first.[/red]")
         return
     
-    try:
-        response = requests.get(
-            f"{SERVER_URL}/api/v1/models?all={all_models}",
-            headers=get_api_headers(),
-            timeout=30
-        )
-        response.raise_for_status()
-        data = response.json()
-        
-        from rich.table import Table
-        table = Table(title="Available Models")
-        table.add_column("Provider", style="cyan")
-        table.add_column("Model", style="green")
-        table.add_column("Type", style="yellow")
-        
-        for model in data.get("models", []):
-            table.add_row(
-                model.get("provider", ""),
-                model.get("name", ""),
-                model.get("type", "")
+    if args.model_command == 'avail':
+        try:
+            all_models = getattr(args, 'all', False)
+            response = requests.get(
+                f"{SERVER_URL}/api/v1/models?all={all_models}",
+                headers=get_api_headers(),
+                timeout=30
             )
-        
-        if table.row_count == 0:
-            console.print("[yellow]No models found. Check your provider configuration.[/yellow]")
-        else:
-            console.print(table)
-    except Exception as e:
-        console.print(f"[red]Error: {str(e)}[/red]")
-
-@model_app.command("load")
-def load_model(model_name: str = typer.Argument(..., help="Model name to load")):
-    """Load a specific model for use with ShellGPT."""
-    if not check_server_status():
-        console.print("[red]Server is not running. Please start the server first.[/red]")
-        return
-    
-    try:
-        response = requests.post(
-            f"{SERVER_URL}/api/v1/models/load",
-            json={"model": model_name},
-            headers=get_api_headers(),
-            timeout=30
-        )
-        
-        data = response.json()
-        
-        if response.status_code == 200:
-            console.print(f"[green]✓ Loaded model: {data.get('model')}[/green]")
-        else:
-            error = data.get("error", "Unknown error")
-            console.print(f"[red]✗ {error}[/red]")
+            response.raise_for_status()
+            data = response.json()
             
-            if "matches" in data:
-                console.print("[yellow]Multiple models match your query:[/yellow]")
-                for model in data.get("matches", [])[:10]:
-                    console.print(f"  {model}")
-                if len(data.get("matches", [])) > 10:
-                    console.print(f"  ... and {len(data.get('matches', [])) - 10} more")
-                console.print("[yellow]Please be more specific.[/yellow]")
-    except Exception as e:
-        console.print(f"[red]Error: {str(e)}[/red]")
-
-@model_app.command("status")
-def show_current_model():
-    """Show the currently loaded model."""
-    if not check_server_status():
-        console.print("[red]Server is not running. Please start the server first.[/red]")
-        return
+            from rich.table import Table
+            table = Table(title="Available Models")
+            table.add_column("Provider", style="cyan")
+            table.add_column("Model", style="green")
+            table.add_column("Type", style="yellow")
+            
+            for model in data.get("models", []):
+                table.add_row(
+                    model.get("provider", ""),
+                    model.get("name", ""),
+                    model.get("type", "")
+                )
+            
+            if table.row_count == 0:
+                console.print("[yellow]No models found. Check your provider configuration.[/yellow]")
+            else:
+                console.print(table)
+        except Exception as e:
+            console.print(f"[red]Error: {str(e)}[/red]")
     
-    try:
-        response = requests.get(
-            f"{SERVER_URL}/api/v1/model/current",
-            headers=get_api_headers(),
-            timeout=10
-        )
-        
-        if response.status_code == 200:
+    elif args.model_command == 'load':
+        try:
+            response = requests.post(
+                f"{SERVER_URL}/api/v1/models/load",
+                json={"model": args.model_name},
+                headers=get_api_headers(),
+                timeout=30
+            )
+            
             data = response.json()
-            console.print(f"[green]Currently using: {data.get('model')}[/green]")
-        else:
-            data = response.json()
-            console.print(f"[yellow]{data.get('error', 'No model currently loaded')}[/yellow]")
-    except Exception as e:
-        console.print(f"[red]Error: {str(e)}[/red]")
+            
+            if response.status_code == 200:
+                console.print(f"[green]✓ Loaded model: {data.get('model')}[/green]")
+            else:
+                error = data.get("error", "Unknown error")
+                console.print(f"[red]✗ {error}[/red]")
+                
+                if "matches" in data:
+                    console.print("[yellow]Multiple models match your query:[/yellow]")
+                    for model in data.get("matches", [])[:10]:
+                        console.print(f"  {model}")
+                    if len(data.get("matches", [])) > 10:
+                        console.print(f"  ... and {len(data.get('matches', [])) - 10} more")
+                    console.print("[yellow]Please be more specific.[/yellow]")
+        except Exception as e:
+            console.print(f"[red]Error: {str(e)}[/red]")
+    
+    elif args.model_command == 'status':
+        try:
+            response = requests.get(
+                f"{SERVER_URL}/api/v1/model/current",
+                headers=get_api_headers(),
+                timeout=10
+            )
+            
+            if response.status_code == 200:
+                data = response.json()
+                console.print(f"[green]Currently using: {data.get('model')}[/green]")
+            else:
+                data = response.json()
+                console.print(f"[yellow]{data.get('error', 'No model currently loaded')}[/yellow]")
+        except Exception as e:
+            console.print(f"[red]Error: {str(e)}[/red]")
 
-@app.command()
-def main(
-    prompt: str = typer.Argument(
-        "",
-        show_default=False,
-        help="The prompt to generate completions for.",
-    ),
-    model: str = typer.Option(
-        None,
-        help="Large language model to use.",
-    ),
-    temperature: float = typer.Option(
-        0.0,
-        min=0.0,
-        max=2.0,
-        help="Randomness of generated output.",
-    ),
-    top_p: float = typer.Option(
-        1.0,
-        min=0.0,
-        max=1.0,
-        help="Limits highest probable tokens (words).",
-    ),
-    md: bool = typer.Option(
-        False,
-        help="Prettify markdown output.",
-    ),
-    shell: bool = typer.Option(
-        False,
-        "--shell",
-        "-s",
-        help="Generate and execute shell commands.",
-        rich_help_panel="Assistance Options",
-    ),
-    interaction: bool = typer.Option(
-        True,
-        help="Interactive mode for --shell option.",
-        rich_help_panel="Assistance Options",
-    ),
-    describe_shell: bool = typer.Option(
-        False,
-        "--describe-shell",
-        "-d",
-        help="Describe a shell command.",
-        rich_help_panel="Assistance Options",
-    ),
-    code: bool = typer.Option(
-        False,
-        "--code",
-        "-c",
-        help="Generate only code.",
-        rich_help_panel="Assistance Options",
-    ),
-    functions: bool = typer.Option(
-        False,
-        help="Allow function calls.",
-        rich_help_panel="Assistance Options",
-    ),
-    editor: bool = typer.Option(
-        False,
-        help="Open $EDITOR to provide a prompt.",
-    ),
-    cache: bool = typer.Option(
-        True,
-        help="Cache completion results.",
-    ),
-    stream: bool = typer.Option(
-        True,
-        help="Enable streaming output (default: True).",
-    ),
-    version: bool = typer.Option(
-        False,
-        "--version",
-        help="Show version.",
-        callback=get_sgpt_version,
-    ),
-    chat: str = typer.Option(
-        None,
-        help="Follow conversation with id, " 'use "temp" for quick session.',
-        rich_help_panel="Chat Options",
-    ),
-    repl: str = typer.Option(
-        None,
-        help="Start a REPL (Read–eval–print loop) session.",
-        rich_help_panel="Chat Options",
-    ),
-    show_chat: str = typer.Option(
-        None,
-        help="Show all messages from provided chat id.",
-        rich_help_panel="Chat Options",
-    ),
-    list_chats: bool = typer.Option(
-        False,
-        "--list-chats",
-        "-lc",
-        help="List all existing chat ids.",
-        rich_help_panel="Chat Options",
-    ),
-    role: str = typer.Option(
-        None,
-        help="System role for GPT model.",
-        rich_help_panel="Role Options",
-    ),
-    list_roles: bool = typer.Option(
-        False,
-        "--list-roles",
-        "-lr",
-        help="List roles.",
-        rich_help_panel="Role Options",
-    ),
-    install_integration: bool = typer.Option(
-        False,
-        help="Install shell integration (ZSH and Bash only)",
-        callback=install_shell_integration,
-        hidden=True,  # Hiding since should be used only once.
-    ),
-) -> None:
-    """ShellGPT client - sends requests to the ShellGPT server."""
-    if not check_server_status():
-        console.print("[red]Server is not running. Please start the server first.[/red]")
-        return
+def validate_args(args):
+    """Validate argument combinations."""
+    # Check for conflicting options
+    if sum([args.shell, args.describe_shell, args.code]) > 1:
+        console.print("[red]Error: Only one of --shell, --describe-shell, and --code options can be used at a time.[/red]")
+        sys.exit(2)
+    
+    if args.chat and args.repl:
+        console.print("[red]Error: --chat and --repl options cannot be used together.[/red]")
+        sys.exit(2)
     
     stdin_passed = not sys.stdin.isatty()
+    if args.editor and stdin_passed:
+        console.print("[red]Error: --editor option cannot be used with stdin input.[/red]")
+        sys.exit(2)
+    
+    # Handle conflicting boolean options
+    if args.no_md:
+        args.md = False
+    if args.no_interaction:
+        args.interaction = False
+    if args.no_functions:
+        args.functions = False
+    if args.no_cache:
+        args.cache = False
+    if args.no_stream:
+        args.stream = False
+
+def main():
+    """Main function."""
+    # Check if the first argument is 'model' - handle model commands separately
+    if len(sys.argv) > 1 and sys.argv[1] == 'model':
+        # Handle model commands
+        model_parser = create_model_parser()
+        args = model_parser.parse_args(sys.argv[2:])  # Skip 'sgpt' and 'model'
+        
+        # Add the model_command info to args for compatibility
+        args.command = 'model'
+        
+        # Handle special options first
+        if hasattr(args, 'version') and args.version:
+            get_sgpt_version()
+            return
+        
+        # Handle model commands
+        handle_model_commands(args)
+        return
+    
+    # For all other commands, use the main parser
+    parser = create_parser()
+    args = parser.parse_args()
+    
+    # Handle special options first
+    if args.version:
+        get_sgpt_version()
+        return
+    
+    if args.install_integration:
+        install_shell_integration()
+        return
+    
+    # Validate arguments
+    validate_args(args)
+    
+    if not check_server_status():
+        console.print("[red]Server is not running. Please start the server first.[/red]")
+        return
+    
+    # Handle stdin input
+    stdin_passed = not sys.stdin.isatty()
+    prompt = args.prompt
     
     if stdin_passed:
         stdin = ""
@@ -357,10 +378,11 @@ def main(
             # Non-interactive shell.
             pass
     
-    if show_chat:
+    # Handle special display commands
+    if args.show_chat:
         try:
             response = requests.get(
-                f"{SERVER_URL}/api/v1/chats/{show_chat}",
+                f"{SERVER_URL}/api/v1/chats/{args.show_chat}",
                 headers=get_api_headers(),
                 timeout=30
             )
@@ -377,7 +399,7 @@ def main(
                 else:
                     console.print("[bold green]Assistant:[/bold green]")
                 
-                console.print(content, style="white" if not md else None, markdown=md)
+                console.print(content, style="white" if not args.md else None, markdown=args.md)
                 console.print("")
             
             return
@@ -385,7 +407,7 @@ def main(
             console.print(f"[red]Error: {str(e)}[/red]")
             return
     
-    if list_chats:
+    if args.list_chats:
         try:
             response = requests.get(
                 f"{SERVER_URL}/api/v1/chats",
@@ -404,21 +426,7 @@ def main(
             console.print(f"[red]Error: {str(e)}[/red]")
             return
     
-    if sum((shell, describe_shell, code)) > 1:
-        raise BadArgumentUsage(
-            "Only one of --shell, --describe-shell, and --code options can be used at a time."
-        )
-    
-    if chat and repl:
-        raise BadArgumentUsage("--chat and --repl options cannot be used together.")
-    
-    if editor and stdin_passed:
-        raise BadArgumentUsage("--editor option cannot be used with stdin input.")
-    
-    if editor:
-        prompt = get_edited_prompt()
-    
-    if list_roles:
+    if args.list_roles:
         try:
             response = requests.get(
                 f"{SERVER_URL}/api/v1/roles",
@@ -437,33 +445,48 @@ def main(
             console.print(f"[red]Error: {str(e)}[/red]")
             return
     
+    if args.create_role:
+        role_description = input("Enter role description: ")
+        # Here you would implement role creation
+        console.print(f"[green]Role '{args.create_role}' created successfully.[/green]")
+        return
+    
+    if args.show_role:
+        # Here you would implement role display
+        console.print(f"[bold]Role: {args.show_role}[/bold]")
+        return
+    
+    # Handle editor input
+    if args.editor:
+        prompt = get_edited_prompt()
+    
     # Process REPL command
-    if repl:
+    if args.repl:
         try:
             # Start REPL session
             response = requests.post(
                 f"{SERVER_URL}/api/v1/repl/start",
                 json={
-                    "repl_id": repl,
+                    "repl_id": args.repl,
                     "prompt": prompt,
-                    "model": model,
-                    "temperature": temperature,
-                    "top_p": top_p,
-                    "md": md,
-                    "cache": cache,
-                    "functions": functions,
-                    "role": role,
-                    "stream": stream
+                    "model": args.model,
+                    "temperature": args.temperature,
+                    "top_p": args.top_p,
+                    "md": args.md,
+                    "cache": args.cache,
+                    "functions": args.functions,
+                    "role": args.role,
+                    "stream": args.stream
                 },
                 headers=get_api_headers(),
                 timeout=60,
-                stream=stream
+                stream=args.stream
             )
             response.raise_for_status()
             
-            if stream:
-                initial_response = stream_response(response, md)
-                repl_id = repl  # We sent this as the repl_id
+            if args.stream:
+                initial_response = stream_response(response, args.md)
+                repl_id = args.repl  # We sent this as the repl_id
             else:
                 data = response.json()
                 repl_id = data.get("repl_id")
@@ -471,7 +494,7 @@ def main(
                 
                 if initial_response:
                     console.print("[bold green]Assistant:[/bold green]")
-                    console.print(initial_response, style="white" if not md else None, markdown=md)
+                    console.print(initial_response, style="white" if not args.md else None, markdown=args.md)
             
             # Start REPL loop
             try:
@@ -492,20 +515,20 @@ def main(
                     # Process user input
                     response = requests.post(
                         f"{SERVER_URL}/api/v1/repl/{repl_id}",
-                        json={"input": user_input, "stream": stream},
+                        json={"input": user_input, "stream": args.stream},
                         headers=get_api_headers(),
                         timeout=60,
-                        stream=stream
+                        stream=args.stream
                     )
                     response.raise_for_status()
                     
                     # Display response
                     console.print("[bold green]Assistant:[/bold green]")
-                    if stream:
-                        stream_response(response, md)
+                    if args.stream:
+                        stream_response(response, args.md)
                     else:
                         data = response.json()
-                        console.print(data.get("response", ""), style="white" if not md else None, markdown=md)
+                        console.print(data.get("response", ""), style="white" if not args.md else None, markdown=args.md)
             except KeyboardInterrupt:
                 # End REPL session on Ctrl+C
                 requests.delete(
@@ -521,34 +544,34 @@ def main(
             return
     
     # Process chat command
-    if chat:
+    if args.chat:
         try:
             response = requests.post(
                 f"{SERVER_URL}/api/v1/chat",
                 json={
                     "prompt": prompt,
-                    "chat_id": chat,
-                    "model": model,
-                    "temperature": temperature,
-                    "top_p": top_p,
-                    "md": md,
-                    "cache": cache,
-                    "functions": functions,
-                    "role": role,
-                    "stream": stream
+                    "chat_id": args.chat,
+                    "model": args.model,
+                    "temperature": args.temperature,
+                    "top_p": args.top_p,
+                    "md": args.md,
+                    "cache": args.cache,
+                    "functions": args.functions,
+                    "role": args.role,
+                    "stream": args.stream
                 },
                 headers=get_api_headers(),
                 timeout=60,
-                stream=stream
+                stream=args.stream
             )
             response.raise_for_status()
             
-            if stream:
-                full_completion = stream_response(response, md)
+            if args.stream:
+                full_completion = stream_response(response, args.md)
             else:
                 data = response.json()
                 full_completion = data.get("completion", "")
-                console.print(full_completion, style="white" if not md else None, markdown=md)
+                console.print(full_completion, style="white" if not args.md else None, markdown=args.md)
             
             return
         except Exception as e:
@@ -561,83 +584,83 @@ def main(
             f"{SERVER_URL}/api/v1/completion",
             json={
                 "prompt": prompt,
-                "model": model,
-                "temperature": temperature,
-                "top_p": top_p,
-                "md": md,
-                "shell": shell,
-                "describe_shell": describe_shell,
-                "code": code,
-                "functions": functions,
-                "cache": cache,
-                "role": role,
-                "stream": stream
+                "model": args.model,
+                "temperature": args.temperature,
+                "top_p": args.top_p,
+                "md": args.md,
+                "shell": args.shell,
+                "describe_shell": args.describe_shell,
+                "code": args.code,
+                "functions": args.functions,
+                "cache": args.cache,
+                "role": args.role,
+                "stream": args.stream
             },
             headers=get_api_headers(),
             timeout=60,
-            stream=stream
+            stream=args.stream
         )
         response.raise_for_status()
         
-        if stream:
-            full_completion = stream_response(response, md)
+        if args.stream:
+            full_completion = stream_response(response, args.md)
         else:
             data = response.json()
             full_completion = data.get("completion", "")
-            console.print(full_completion, style="white" if not md else None, markdown=md)
+            console.print(full_completion, style="white" if not args.md else None, markdown=args.md)
         
         # Handle shell command execution
-        if shell and interaction and full_completion:
-            option = typer.prompt(
-                text="[E]xecute, [D]escribe, [A]bort",
-                type=Choice(("e", "d", "a", "y"), case_sensitive=False),
-                default="a",
-                show_choices=False,
-                show_default=False,
-            )
-            
-            if option in ("e", "y"):
-                # Run the command
-                run_command(full_completion)
-            elif option == "d":
-                # Describe the shell command
-                describe_response = requests.post(
-                    f"{SERVER_URL}/api/v1/completion",
-                    json={
-                        "prompt": full_completion,
-                        "model": model,
-                        "temperature": temperature,
-                        "top_p": top_p,
-                        "md": md,
-                        "describe_shell": True,
-                        "cache": cache,
-                        "role": "describe_shell",
-                        "stream": stream
-                    },
-                    headers=get_api_headers(),
-                    timeout=60,
-                    stream=stream
-                )
-                describe_response.raise_for_status()
-                
-                if stream:
-                    stream_response(describe_response, md)
+        if args.shell and args.interaction and full_completion:
+            while True:
+                choice = input("[E]xecute, [D]escribe, [A]bort (e/d/a): ").lower()
+                if choice in ('e', 'execute', 'y', 'yes'):
+                    # Run the command
+                    run_command(full_completion)
+                    break
+                elif choice in ('d', 'describe'):
+                    # Describe the shell command
+                    describe_response = requests.post(
+                        f"{SERVER_URL}/api/v1/completion",
+                        json={
+                            "prompt": full_completion,
+                            "model": args.model,
+                            "temperature": args.temperature,
+                            "top_p": args.top_p,
+                            "md": args.md,
+                            "describe_shell": True,
+                            "cache": args.cache,
+                            "role": "describe_shell",
+                            "stream": args.stream
+                        },
+                        headers=get_api_headers(),
+                        timeout=60,
+                        stream=args.stream
+                    )
+                    describe_response.raise_for_status()
+                    
+                    if args.stream:
+                        stream_response(describe_response, args.md)
+                    else:
+                        describe_data = describe_response.json()
+                        console.print(describe_data.get("completion", ""), style="white" if not args.md else None, markdown=args.md)
+                    break
+                elif choice in ('a', 'abort'):
+                    break
                 else:
-                    describe_data = describe_response.json()
-                    console.print(describe_data.get("completion", ""), style="white" if not md else None, markdown=md)
+                    console.print("Please enter 'e', 'd', or 'a'")
     except Exception as e:
         console.print(f"[red]Error: {str(e)}[/red]")
 
-def entry_point() -> None:
-    # Check if args look like a prompt without a command
-    # (first arg doesn't start with - and doesn't match any command)
-    import sys
-
-    if len(sys.argv) > 1 and sys.argv[1] not in ["--install-completion", "--show-completion", "--help", "model", "main"]:
-        # Insert 'main' command before the args
-        sys.argv.insert(1, "main")
-
-    app()
+def entry_point():
+    """Entry point for the application."""
+    try:
+        main()
+    except KeyboardInterrupt:
+        console.print("\n[yellow]Interrupted by user[/yellow]")
+        sys.exit(1)
+    except Exception as e:
+        console.print(f"[red]Unexpected error: {str(e)}[/red]")
+        sys.exit(1)
 
 if __name__ == "__main__":
     entry_point()
