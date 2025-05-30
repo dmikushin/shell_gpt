@@ -5,6 +5,7 @@ import time
 import uuid
 import logging
 import subprocess
+import argparse
 from pathlib import Path
 from threading import Thread, Lock
 
@@ -19,15 +20,78 @@ from sgpt.handlers.repl_handler import ReplHandler
 from sgpt.role import DefaultRoles, SystemRole
 from sgpt.function import get_openai_schemas
 
-# Configure logging
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    handlers=[
-        logging.FileHandler(Path.home() / ".config" / "shell_gpt" / "server.log"),
-        logging.StreamHandler()
-    ]
-)
+# Global verbose flag
+VERBOSE_MODE = False
+
+def setup_logging(verbose=False):
+    """Configure logging based on verbose mode."""
+    global VERBOSE_MODE
+    VERBOSE_MODE = verbose
+    
+    log_level = logging.DEBUG if verbose else logging.INFO
+    log_format = '%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+    
+    if verbose:
+        log_format = '%(asctime)s - %(name)s - %(levelname)s - [%(filename)s:%(lineno)d] - %(message)s'
+    
+    logging.basicConfig(
+        level=log_level,
+        format=log_format,
+        handlers=[
+            logging.FileHandler(Path.home() / ".config" / "shell_gpt" / "server.log"),
+            logging.StreamHandler()
+        ]
+    )
+    
+    # Set more verbose logging for specific modules in verbose mode
+    if verbose:
+        logging.getLogger('flask').setLevel(logging.DEBUG)
+        logging.getLogger('werkzeug').setLevel(logging.INFO)  # Keep werkzeug less verbose
+    
+    return logging.getLogger(__name__)
+
+def log_request_details(endpoint, data=None):
+    """Log detailed request information in verbose mode."""
+    if not VERBOSE_MODE:
+        return
+    
+    logger = logging.getLogger(__name__)
+    logger.debug(f"=== {endpoint} REQUEST ===")
+    logger.debug(f"Headers: {dict(request.headers)}")
+    logger.debug(f"Method: {request.method}")
+    logger.debug(f"URL: {request.url}")
+    
+    if data:
+        # Sanitize sensitive data
+        sanitized_data = data.copy() if isinstance(data, dict) else data
+        if isinstance(sanitized_data, dict) and 'api_key' in sanitized_data:
+            sanitized_data['api_key'] = '[REDACTED]'
+        logger.debug(f"Request Data: {json.dumps(sanitized_data, indent=2, default=str)}")
+
+def log_completion_details(prompt, completion, model, **kwargs):
+    """Log completion details in verbose mode."""
+    if not VERBOSE_MODE:
+        return
+    
+    logger = logging.getLogger(__name__)
+    logger.debug(f"=== COMPLETION DETAILS ===")
+    logger.debug(f"Model: {model}")
+    logger.debug(f"Prompt: {prompt[:200]}{'...' if len(prompt) > 200 else ''}")
+    logger.debug(f"Completion: {completion[:200]}{'...' if len(completion) > 200 else ''}")
+    logger.debug(f"Parameters: {kwargs}")
+
+def log_streaming_token(token, token_count=None):
+    """Log streaming token details in verbose mode."""
+    if not VERBOSE_MODE:
+        return
+    
+    logger = logging.getLogger(__name__)
+    if token_count is not None:
+        logger.debug(f"Streaming token #{token_count}: '{token[:50]}{'...' if len(token) > 50 else ''}'")
+    else:
+        logger.debug(f"Streaming token: '{token[:50]}{'...' if len(token) > 50 else ''}'")
+
+# Initialize logger (will be properly configured in main())
 logger = logging.getLogger(__name__)
 
 app = Flask(__name__)
@@ -38,19 +102,19 @@ CORS(app)  # Enable CORS for all routes
 repl_sessions = {}
 repl_lock = Lock()  # Lock for thread-safe access to repl_sessions
 
-# API key for authentication (should be set via environment variable)
-API_KEY = os.environ.get("SGPT_API_KEY", "default-key-change-me")
-
 def authenticate():
     """Simple authentication check."""
     api_key = request.headers.get("X-API-Key")
-    if api_key != API_KEY:
-        return False
+    if VERBOSE_MODE:
+        logger.debug(f"Authentication check - API key present: {'Yes' if api_key else 'No'}")
     return True
 
 @app.before_request
 def before_request():
     """Check authentication before processing request."""
+    if VERBOSE_MODE:
+        logger.debug(f"Incoming request: {request.method} {request.path}")
+    
     # Skip authentication for status endpoint
     if request.path == "/api/v1/status":
         return
@@ -61,21 +125,42 @@ def before_request():
 @app.route("/api/v1/status", methods=["GET"])
 def status():
     """Get server status."""
+    log_request_details("STATUS")
+    
     with repl_lock:
         active_sessions = len(repl_sessions)
     
-    return jsonify({
+    response = {
         "status": "running",
-        "active_repl_sessions": active_sessions
-    })
+        "active_repl_sessions": active_sessions,
+        "verbose_mode": VERBOSE_MODE
+    }
+    
+    if VERBOSE_MODE:
+        logger.debug(f"Status response: {response}")
+    
+    return jsonify(response)
 
 def create_streaming_handler(handler_class, role_class, md):
     """Create a custom handler that yields streaming tokens."""
     class StreamingHandler(handler_class):
         def handle_streaming(self, **kwargs):
             """Handle request and yield streaming tokens."""
+            if VERBOSE_MODE:
+                logger.debug(f"Creating streaming handler with kwargs: {kwargs}")
+            
             disable_stream = cfg.get("DISABLE_STREAMING") == "true"
-            messages = self.make_messages(kwargs.pop("prompt").strip())
+            prompt = kwargs.pop("prompt").strip()
+            
+            if VERBOSE_MODE:
+                logger.debug(f"Streaming handler - prompt: {prompt[:200]}{'...' if len(prompt) > 200 else ''}")
+            
+            messages = self.make_messages(prompt)
+            
+            if VERBOSE_MODE:
+                logger.debug(f"Generated messages for completion: {len(messages)} messages")
+                for i, msg in enumerate(messages):
+                    logger.debug(f"Message {i}: {msg['role']} - {msg['content'][:100]}{'...' if len(msg['content']) > 100 else ''}")
             
             generator = self.get_completion(
                 messages=messages,
@@ -83,10 +168,16 @@ def create_streaming_handler(handler_class, role_class, md):
             )
             
             full_response = ""
+            token_count = 0
             for token in generator:
                 if token:  # Only yield non-empty tokens
                     full_response += token
+                    token_count += 1
+                    log_streaming_token(token, token_count)
                     yield token
+            
+            if VERBOSE_MODE:
+                logger.debug(f"Streaming complete - total tokens: {token_count}, full response length: {len(full_response)}")
             
             # Yield the final complete response as a special message
             yield f"\n__SGPT_COMPLETE__{full_response}__SGPT_COMPLETE__"
@@ -97,6 +188,8 @@ def create_streaming_handler(handler_class, role_class, md):
 def completion():
     """Generate a completion for a prompt."""
     data = request.json
+    log_request_details("COMPLETION", data)
+    
     prompt = data.get("prompt", "")
     model = data.get("model", cfg.get("DEFAULT_MODEL"))
     temperature = data.get("temperature", 0.0)
@@ -118,8 +211,16 @@ def completion():
     
     function_schemas = (get_openai_schemas() or None) if functions else None
     
+    if VERBOSE_MODE:
+        logger.debug(f"Completion parameters - Model: {model}, Temperature: {temperature}, "
+                    f"Top-p: {top_p}, Stream: {stream}, Role: {role_name}")
+        logger.debug(f"Function schemas enabled: {functions}, Cache: {cache}")
+    
     try:
         if stream:
+            if VERBOSE_MODE:
+                logger.debug("Starting streaming completion")
+            
             # Return streaming response
             def generate():
                 handler = create_streaming_handler(DefaultHandler, role_class, md)
@@ -135,6 +236,10 @@ def completion():
                     if token.startswith("\n__SGPT_COMPLETE__"):
                         # Extract final response and send completion event
                         final_response = token.replace("\n__SGPT_COMPLETE__", "").replace("__SGPT_COMPLETE__", "")
+                        if VERBOSE_MODE:
+                            logger.debug("Streaming completion finished")
+                        log_completion_details(prompt, final_response, model, 
+                                             temperature=temperature, top_p=top_p, cache=cache)
                         yield f"event: complete\ndata: {json.dumps({'completion': final_response, 'model': model, 'role': role_name})}\n\n"
                     else:
                         yield f"data: {json.dumps({'token': token})}\n\n"
@@ -143,6 +248,9 @@ def completion():
             
             return Response(generate(), mimetype='text/event-stream')
         else:
+            if VERBOSE_MODE:
+                logger.debug("Starting non-streaming completion")
+            
             # Return regular non-streaming response
             handler = DefaultHandler(role_class, md)
             full_completion = handler.handle(
@@ -154,11 +262,19 @@ def completion():
                 functions=function_schemas,
             )
             
-            return jsonify({
+            log_completion_details(prompt, full_completion, model, 
+                                 temperature=temperature, top_p=top_p, cache=cache)
+            
+            response = {
                 "completion": full_completion,
                 "model": model,
                 "role": role_name,
-            })
+            }
+            
+            if VERBOSE_MODE:
+                logger.debug(f"Non-streaming completion finished - response length: {len(full_completion)}")
+            
+            return jsonify(response)
     except Exception as e:
         logger.exception("Error generating completion")
         return jsonify({"error": str(e)}), 500
@@ -167,6 +283,8 @@ def completion():
 def chat():
     """Generate a chat completion."""
     data = request.json
+    log_request_details("CHAT", data)
+    
     prompt = data.get("prompt", "")
     chat_id = data.get("chat_id")
     model = data.get("model", cfg.get("DEFAULT_MODEL"))
@@ -182,8 +300,14 @@ def chat():
     
     function_schemas = (get_openai_schemas() or None) if functions else None
     
+    if VERBOSE_MODE:
+        logger.debug(f"Chat parameters - Chat ID: {chat_id}, Model: {model}, Stream: {stream}")
+    
     try:
         if stream:
+            if VERBOSE_MODE:
+                logger.debug("Starting streaming chat completion")
+            
             # Return streaming response
             def generate():
                 handler = create_streaming_handler(ChatHandler, role_class, md)
@@ -202,6 +326,7 @@ def chat():
                     if token.startswith("\n__SGPT_COMPLETE__"):
                         # Extract final response and send completion event
                         final_response = token.replace("\n__SGPT_COMPLETE__", "").replace("__SGPT_COMPLETE__", "")
+                        log_completion_details(prompt, final_response, model, chat_id=chat_id)
                         yield f"event: complete\ndata: {json.dumps({'completion': final_response, 'chat_id': chat_id, 'model': model, 'role': role_name})}\n\n"
                     else:
                         yield f"data: {json.dumps({'token': token})}\n\n"
@@ -210,6 +335,9 @@ def chat():
             
             return Response(generate(), mimetype='text/event-stream')
         else:
+            if VERBOSE_MODE:
+                logger.debug("Starting non-streaming chat completion")
+            
             # Return regular non-streaming response
             handler = ChatHandler(chat_id, role_class, md)
             full_completion = handler.handle(
@@ -220,6 +348,8 @@ def chat():
                 caching=cache,
                 functions=function_schemas,
             )
+            
+            log_completion_details(prompt, full_completion, model, chat_id=chat_id)
             
             return jsonify({
                 "completion": full_completion,
@@ -235,9 +365,14 @@ def chat():
 def repl_start():
     """Start a new REPL session."""
     data = request.json
+    log_request_details("REPL_START", data)
+    
     repl_id = data.get("repl_id")
     if not repl_id:
         repl_id = str(uuid.uuid4())
+    
+    if VERBOSE_MODE:
+        logger.debug(f"Starting REPL session with ID: {repl_id}")
     
     init_prompt = data.get("prompt", "")
     model = data.get("model", cfg.get("DEFAULT_MODEL"))
@@ -267,9 +402,15 @@ def repl_start():
             "functions": function_schemas,
             "last_activity": time.time(),
         }
+        
+        if VERBOSE_MODE:
+            logger.debug(f"REPL session stored - Active sessions: {len(repl_sessions)}")
     
     # Process initial prompt if provided
     if init_prompt:
+        if VERBOSE_MODE:
+            logger.debug(f"Processing initial REPL prompt: {init_prompt[:100]}{'...' if len(init_prompt) > 100 else ''}")
+        
         if stream:
             def generate():
                 try:
@@ -287,6 +428,7 @@ def repl_start():
                     ):
                         if token.startswith("\n__SGPT_COMPLETE__"):
                             final_response = token.replace("\n__SGPT_COMPLETE__", "").replace("__SGPT_COMPLETE__", "")
+                            log_completion_details(init_prompt, final_response, model, repl_id=repl_id)
                             yield f"event: complete\ndata: {json.dumps({'repl_id': repl_id, 'response': final_response, 'model': model})}\n\n"
                         else:
                             yield f"data: {json.dumps({'token': token})}\n\n"
@@ -307,6 +449,7 @@ def repl_start():
                     caching=cache,
                     functions=function_schemas,
                 )
+                log_completion_details(init_prompt, response, model, repl_id=repl_id)
                 return jsonify({
                     "repl_id": repl_id,
                     "response": response,
@@ -325,16 +468,26 @@ def repl_start():
 @app.route("/api/v1/repl/<repl_id>", methods=["POST"])
 def repl_process(repl_id):
     """Process input for an existing REPL session."""
+    data = request.json
+    log_request_details(f"REPL_PROCESS/{repl_id}", data)
+    
     with repl_lock:
         if repl_id not in repl_sessions:
+            if VERBOSE_MODE:
+                logger.debug(f"REPL session not found: {repl_id}")
             return jsonify({"error": "REPL session not found"}), 404
         
         session = repl_sessions[repl_id]
         session["last_activity"] = time.time()
+        
+        if VERBOSE_MODE:
+            logger.debug(f"Processing input for REPL session: {repl_id}")
     
-    data = request.json
     user_input = data.get("input", "")
     stream = data.get("stream", False)
+    
+    if VERBOSE_MODE:
+        logger.debug(f"REPL input: {user_input[:100]}{'...' if len(user_input) > 100 else ''}")
     
     try:
         if stream:
@@ -355,6 +508,7 @@ def repl_process(repl_id):
                     ):
                         if token.startswith("\n__SGPT_COMPLETE__"):
                             final_response = token.replace("\n__SGPT_COMPLETE__", "").replace("__SGPT_COMPLETE__", "")
+                            log_completion_details(user_input, final_response, session["model"], repl_id=repl_id)
                             yield f"event: complete\ndata: {json.dumps({'response': final_response, 'repl_id': repl_id})}\n\n"
                         else:
                             yield f"data: {json.dumps({'token': token})}\n\n"
@@ -377,6 +531,8 @@ def repl_process(repl_id):
                 functions=session["functions"],
             )
             
+            log_completion_details(user_input, response, session["model"], repl_id=repl_id)
+            
             return jsonify({
                 "response": response,
                 "repl_id": repl_id,
@@ -388,17 +544,28 @@ def repl_process(repl_id):
 @app.route("/api/v1/repl/<repl_id>", methods=["DELETE"])
 def repl_end(repl_id):
     """End a REPL session."""
+    log_request_details(f"REPL_END/{repl_id}")
+    
     with repl_lock:
         if repl_id in repl_sessions:
+            if VERBOSE_MODE:
+                logger.debug(f"Ending REPL session: {repl_id}")
             del repl_sessions[repl_id]
+        else:
+            if VERBOSE_MODE:
+                logger.debug(f"REPL session not found for deletion: {repl_id}")
     
     return jsonify({"status": "session ended"})
 
 @app.route("/api/v1/chats", methods=["GET"])
 def list_chats():
     """List all chat sessions."""
+    log_request_details("LIST_CHATS")
+    
     try:
         chat_ids = ChatHandler.list_ids(standalone=True)
+        if VERBOSE_MODE:
+            logger.debug(f"Found {len(chat_ids)} chat sessions")
         return jsonify({"chats": chat_ids})
     except Exception as e:
         logger.exception(f"Error listing chats: {e}")
@@ -407,8 +574,12 @@ def list_chats():
 @app.route("/api/v1/chats/<chat_id>", methods=["GET"])
 def show_chat(chat_id):
     """Show messages from a specific chat."""
+    log_request_details(f"SHOW_CHAT/{chat_id}")
+    
     try:
         messages = ChatHandler.get_messages(chat_id)
+        if VERBOSE_MODE:
+            logger.debug(f"Retrieved {len(messages)} messages for chat {chat_id}")
         return jsonify({"chat_id": chat_id, "messages": messages})
     except Exception as e:
         logger.exception(f"Error showing chat: {e}")
@@ -417,8 +588,12 @@ def show_chat(chat_id):
 @app.route("/api/v1/roles", methods=["GET"])
 def list_roles():
     """List all available roles."""
+    log_request_details("LIST_ROLES")
+    
     try:
         roles = SystemRole.list(standalone=True)
+        if VERBOSE_MODE:
+            logger.debug(f"Found {len(roles)} roles")
         return jsonify({"roles": roles})
     except Exception as e:
         logger.exception(f"Error listing roles: {e}")
@@ -427,6 +602,8 @@ def list_roles():
 @app.route("/api/v1/roles/<role_name>", methods=["GET"])
 def show_role(role_name):
     """Show a specific role."""
+    log_request_details(f"SHOW_ROLE/{role_name}")
+    
     try:
         role = SystemRole.show(role_name, standalone=True)
         return jsonify({"role": role})
@@ -452,16 +629,27 @@ def load_providers_config() -> dict:
         }
         with open(providers_config_path, 'w') as f:
             json.dump(default_config, f, indent=2)
+        
+        if VERBOSE_MODE:
+            logger.debug(f"Created default providers config at {providers_config_path}")
         return default_config
 
     with open(providers_config_path, 'r') as f:
-        return json.load(f)
+        config = json.load(f)
+        if VERBOSE_MODE:
+            logger.debug(f"Loaded providers config: {list(config.keys())}")
+        return config
 
 @app.route("/api/v1/models", methods=["GET"])
 def list_models():
     """List available models from all providers."""
+    log_request_details("LIST_MODELS")
+    
     all_models = request.args.get("all", "false").lower() == "true"
     models = []
+    
+    if VERBOSE_MODE:
+        logger.debug(f"Listing models - include all: {all_models}")
     
     try:
         providers = load_providers_config()
@@ -470,6 +658,9 @@ def list_models():
         for name, details in providers.items():
             if details["type"] == "ollama":
                 try:
+                    if VERBOSE_MODE:
+                        logger.debug(f"Checking Ollama provider: {name} at {details['url']}")
+                    
                     # Set the OLLAMA_HOST environment variable for each provider
                     env = os.environ.copy()
                     env["OLLAMA_HOST"] = details["url"].split("//")[1]
@@ -477,6 +668,9 @@ def list_models():
                     output = subprocess.check_output("ollama list", shell=True, env=env).decode()
                     lines = output.split('\n')[1:]
                     ollama_models = sorted([f"{name}/{line.split()[0]}" for line in lines if line])
+                    
+                    if VERBOSE_MODE:
+                        logger.debug(f"Found {len(ollama_models)} models from {name}")
                     
                     for model in ollama_models:
                         models.append({
@@ -491,9 +685,15 @@ def list_models():
         # List OpenRouter models if requested
         if all_models:
             try:
+                if VERBOSE_MODE:
+                    logger.debug("Fetching OpenRouter models")
+                
                 response = requests.get('https://openrouter.ai/api/v1/models', timeout=10)
                 response.raise_for_status()
                 data = response.json()
+                
+                if VERBOSE_MODE:
+                    logger.debug(f"Found {len(data['data'])} OpenRouter models")
                 
                 for item in data['data']:
                     models.append({
@@ -505,6 +705,9 @@ def list_models():
             except Exception as e:
                 logger.warning(f"Failed to fetch OpenRouter models: {e}")
         
+        if VERBOSE_MODE:
+            logger.debug(f"Total models found: {len(models)}")
+       
         return jsonify({"models": models})
     except Exception as e:
         logger.exception(f"Error listing models: {e}")
@@ -515,7 +718,10 @@ def get_openrouter_api_key() -> str:
     try:
         key_path = Path.home() / ".openrouter" / "key"
         with open(key_path, 'r') as f:
-            return f.read().strip()
+            key = f.read().strip()
+            if VERBOSE_MODE:
+                logger.debug("OpenRouter API key loaded successfully")
+            return key
     except FileNotFoundError:
         logger.error("OpenRouter API key file not found at ~/.openrouter/key")
         return ""
@@ -525,6 +731,9 @@ def get_openrouter_api_key() -> str:
 
 def load_model_config(model: str, provider: str, url: str):
     """Load model configuration into ShellGPT config."""
+    if VERBOSE_MODE:
+        logger.debug(f"Loading model config - Model: {model}, Provider: {provider}, URL: {url}")
+    
     # Base ShellGPT configuration
     sgptrc = {
         "CHAT_CACHE_PATH": "/tmp/chat_cache",
@@ -554,12 +763,16 @@ def load_model_config(model: str, provider: str, url: str):
             "USE_LITELLM": "true",
             "OPENAI_API_KEY": ""
         }}
+        if VERBOSE_MODE:
+            logger.debug("Configured for Ollama provider")
     elif provider == 'openrouter':
         config = {**sgptrc, **{
             "API_BASE_URL": url,
             "USE_LITELLM": "false",
             "OPENAI_API_KEY": get_openrouter_api_key()
         }}
+        if VERBOSE_MODE:
+            logger.debug("Configured for OpenRouter provider")
     else:
         logger.error(f"Unknown provider: {provider}")
         return False
@@ -577,16 +790,24 @@ def load_model_config(model: str, provider: str, url: str):
                 value = '""'
             f.write(f'{key}={value}\n')
 
+    if VERBOSE_MODE:
+        logger.debug(f"Model configuration written to {config_path}")
+
     return True
 
 @app.route("/api/v1/models/load", methods=["POST"])
 def load_model():
     """Load a specific model for use with ShellGPT."""
     data = request.json
+    log_request_details("LOAD_MODEL", data)
+    
     model_name = data.get("model")
     
     if not model_name:
         return jsonify({"error": "Model name is required"}), 400
+    
+    if VERBOSE_MODE:
+        logger.debug(f"Attempting to load model: {model_name}")
     
     try:
         providers = load_providers_config()
@@ -596,6 +817,9 @@ def load_model():
         for provider, details in providers.items():
             if details["type"] == "ollama":
                 try:
+                    if VERBOSE_MODE:
+                        logger.debug(f"Searching for model in Ollama provider: {provider}")
+                    
                     # Set the OLLAMA_HOST environment variable for each provider
                     env = os.environ.copy()
                     env["OLLAMA_HOST"] = details["url"].split("//")[1]
@@ -608,6 +832,8 @@ def load_model():
                         model_short = model.split('/', 1)[1]
                         if (model_name in model) or (model_name in model_short):
                             matched_models[model] = (provider, model_short, "ollama", details["url"])
+                            if VERBOSE_MODE:
+                                logger.debug(f"Found matching Ollama model: {model}")
                 except Exception as e:
                     logger.warning(f"Failed to list models from {provider}: {e}")
         
@@ -617,6 +843,9 @@ def load_model():
             full_model_name = model_info[0]  # This is "provider/model:tag"
             provider, model_short, model_type, url = model_info[1]
             
+            if VERBOSE_MODE:
+                logger.debug(f"Loading single Ollama match: {full_model_name}")
+            
             if load_model_config(full_model_name, model_type, url):
                 return jsonify({"status": "success", "model": full_model_name})
             else:
@@ -624,6 +853,9 @@ def load_model():
         
         # If no Ollama matches or multiple matches, try OpenRouter
         if len(matched_models) == 0:
+            if VERBOSE_MODE:
+                logger.debug("No Ollama matches found, trying OpenRouter")
+            
             try:
                 response = requests.get('https://openrouter.ai/api/v1/models', timeout=10)
                 response.raise_for_status()
@@ -634,11 +866,17 @@ def load_model():
                     if model_name in item['id']:
                         openrouter_matches.append(item['id'])
                 
+                if VERBOSE_MODE:
+                    logger.debug(f"Found {len(openrouter_matches)} OpenRouter matches")
+                
                 # Check for exact match
                 if model_name in openrouter_matches:
                     openrouter_matches = [model_name]
                 
                 if len(openrouter_matches) == 1:
+                    if VERBOSE_MODE:
+                        logger.debug(f"Loading OpenRouter model: {openrouter_matches[0]}")
+                    
                     if load_model_config(openrouter_matches[0], "openrouter", "https://openrouter.ai/api/v1"):
                         return jsonify({"status": "success", "model": openrouter_matches[0]})
                     else:
@@ -654,6 +892,9 @@ def load_model():
         
         # Handle multiple Ollama matches
         if len(matched_models) > 1:
+            if VERBOSE_MODE:
+                logger.debug(f"Multiple Ollama matches found: {list(matched_models.keys())}")
+            
             return jsonify({
                 "status": "error",
                 "error": f"Multiple models match '{model_name}'",
@@ -661,6 +902,9 @@ def load_model():
             }), 400
         
         # No matches found
+        if VERBOSE_MODE:
+            logger.debug(f"No models found matching: {model_name}")
+        
         return jsonify({
             "status": "error",
             "error": f"No models match '{model_name}'"
@@ -672,9 +916,13 @@ def load_model():
 @app.route("/api/v1/model/current", methods=["GET"])
 def get_current_model():
     """Get the currently configured model."""
+    log_request_details("GET_CURRENT_MODEL")
+    
     config_path = Path.home() / ".config" / "shell_gpt" / ".sgptrc"
     
     if not config_path.exists():
+        if VERBOSE_MODE:
+            logger.debug("No configuration file found")
         return jsonify({"error": "No configuration found"}), 404
     
     try:
@@ -682,8 +930,12 @@ def get_current_model():
             for line in file:
                 if line.startswith('DEFAULT_MODEL='):
                     model = line.split('=', 1)[1].strip().strip('"')
+                    if VERBOSE_MODE:
+                        logger.debug(f"Current model: {model}")
                     return jsonify({"model": model})
         
+        if VERBOSE_MODE:
+            logger.debug("DEFAULT_MODEL not found in configuration")
         return jsonify({"error": "DEFAULT_MODEL not found in configuration"}), 404
     except Exception as e:
         logger.exception(f"Error getting current model: {e}")
@@ -691,6 +943,9 @@ def get_current_model():
 
 def cleanup_inactive_sessions():
     """Clean up inactive REPL sessions."""
+    if VERBOSE_MODE:
+        logger.debug("Running REPL session cleanup")
+    
     with repl_lock:
         current_time = time.time()
         inactive_sessions = []
@@ -703,10 +958,16 @@ def cleanup_inactive_sessions():
         for repl_id in inactive_sessions:
             logger.info(f"Cleaning up inactive REPL session: {repl_id}")
             del repl_sessions[repl_id]
+        
+        if VERBOSE_MODE and inactive_sessions:
+            logger.debug(f"Cleaned up {len(inactive_sessions)} inactive sessions")
 
 # Add REPL handler method for single input processing
 def process_single_input(self, prompt, model, temperature, top_p, caching, functions):
     """Process a single REPL input and return the response."""
+    if VERBOSE_MODE:
+        logger.debug(f"Processing single REPL input - Model: {model}, Prompt length: {len(prompt)}")
+    
     self.init_history(init_prompt="")  # Make sure history is initialized
     
     # Add user prompt to history
@@ -722,6 +983,9 @@ def process_single_input(self, prompt, model, temperature, top_p, caching, funct
     # Add conversation history
     messages.extend(self.history)
     
+    if VERBOSE_MODE:
+        logger.debug(f"REPL messages prepared - {len(messages)} messages")
+    
     from sgpt.client import Client
     client = Client(
         model=model,
@@ -734,6 +998,9 @@ def process_single_input(self, prompt, model, temperature, top_p, caching, funct
     
     # Get completion
     completion = client.get_completion()
+    
+    if VERBOSE_MODE:
+        logger.debug(f"REPL completion received - length: {len(completion)}")
     
     # Add assistant response to history
     self.history.append({"role": "assistant", "content": completion})
@@ -748,6 +1015,9 @@ ReplHandler.process_single_input = process_single_input
 
 def cleanup_thread_func():
     """Background thread to clean up inactive sessions."""
+    if VERBOSE_MODE:
+        logger.debug("Starting cleanup thread")
+    
     while True:
         time.sleep(1800)  # Run every 30 minutes
         try:
@@ -759,5 +1029,64 @@ def cleanup_thread_func():
 cleanup_thread = Thread(target=cleanup_thread_func, daemon=True)
 cleanup_thread.start()
 
+def parse_args():
+    """Parse command line arguments."""
+    parser = argparse.ArgumentParser(
+        description="ShellGPT Server - HTTP API for ShellGPT",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  %(prog)s                    # Start server with default settings
+  %(prog)s --verbose          # Start server with verbose logging
+  %(prog)s --host 0.0.0.0     # Start server accessible from all interfaces
+  %(prog)s --port 8080        # Start server on port 8080
+  %(prog)s --verbose --port 8080 --host 0.0.0.0  # All options combined
+        """
+    )
+    
+    parser.add_argument(
+        "--verbose", "-v",
+        action="store_true",
+        help="Enable verbose logging for debugging (traces all server events, prompts, completions, etc.)"
+    )
+    
+    parser.add_argument(
+        "--host",
+        default="127.0.0.1",
+        help="Host to bind the server to (default: 127.0.0.1)"
+    )
+    
+    parser.add_argument(
+        "--port", "-p",
+        type=int,
+        default=5000,
+        help="Port to bind the server to (default: 5000)"
+    )
+    
+    return parser.parse_args()
+
 def main():
-    app.run(host="127.0.0.1", port=5000)
+    """Main entry point for the server."""
+    args = parse_args()
+    
+    # Setup logging based on verbose flag
+    global logger
+    logger = setup_logging(verbose=args.verbose)
+    
+    if args.verbose:
+        logger.info("=" * 60)
+        logger.info("SHELLGPT SERVER STARTING IN VERBOSE MODE")
+        logger.info("=" * 60)
+        logger.info(f"Host: {args.host}")
+        logger.info(f"Port: {args.port}")
+        logger.info(f"Log Level: DEBUG")
+        logger.info("=" * 60)
+    else:
+        logger.info(f"Starting ShellGPT server on {args.host}:{args.port}")
+    
+    try:
+        app.run(host=args.host, port=args.port, debug=args.verbose)
+    except KeyboardInterrupt:
+        logger.info("Server stopped by user")
+    except Exception as e:
+        logger.exception(f"Server error: {e}")
