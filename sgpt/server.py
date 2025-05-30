@@ -636,6 +636,47 @@ def load_providers_config() -> dict:
             logger.debug(f"Loaded providers config: {list(config.keys())}")
         return config
 
+def get_ollama_models(provider_name: str, base_url: str) -> list:
+    """Get models from an Ollama provider using the REST API."""
+    models = []
+    try:
+        if VERBOSE_MODE:
+            logger.debug(f"Fetching models from Ollama provider: {provider_name} at {base_url}")
+
+        # Make request to the /api/tags endpoint
+        response = requests.get(f"{base_url}/api/tags", timeout=10)
+        response.raise_for_status()
+
+        data = response.json()
+
+        if VERBOSE_MODE:
+            logger.debug(f"Ollama API response: {len(data.get('models', []))} models found")
+
+        for model_info in data.get('models', []):
+            model_name = model_info.get('name', '')
+            if model_name:
+                full_name = f"{provider_name}/{model_name}"
+                models.append({
+                    "provider": provider_name,
+                    "name": model_name,
+                    "full_name": full_name,
+                    "type": "Ollama",
+                    "size": model_info.get('size', 0),
+                    "modified_at": model_info.get('modified_at', ''),
+                    "digest": model_info.get('digest', ''),
+                    "details": model_info.get('details', {})
+                })
+
+                if VERBOSE_MODE:
+                    logger.debug(f"Added Ollama model: {full_name}")
+
+    except requests.exceptions.RequestException as e:
+        logger.warning(f"Failed to fetch models from Ollama provider {provider_name} at {base_url}: {e}")
+    except Exception as e:
+        logger.warning(f"Error processing Ollama models from {provider_name}: {e}")
+
+    return models
+
 @app.route("/api/v1/models", methods=["GET"])
 def list_models():
     """List available models from all providers."""
@@ -650,33 +691,11 @@ def list_models():
     try:
         providers = load_providers_config()
         
-        # List Ollama models
-        for name, details in providers.items():
-            if details["type"] == "ollama":
-                try:
-                    if VERBOSE_MODE:
-                        logger.debug(f"Checking Ollama provider: {name} at {details['url']}")
-                    
-                    # Set the OLLAMA_HOST environment variable for each provider
-                    env = os.environ.copy()
-                    env["OLLAMA_HOST"] = details["url"].split("//")[1]
-                    
-                    output = subprocess.check_output("ollama list", shell=True, env=env).decode()
-                    lines = output.split('\n')[1:]
-                    ollama_models = sorted([f"{name}/{line.split()[0]}" for line in lines if line])
-                    
-                    if VERBOSE_MODE:
-                        logger.debug(f"Found {len(ollama_models)} models from {name}")
-                    
-                    for model in ollama_models:
-                        models.append({
-                            "provider": name,
-                            "name": model.split('/', 1)[1],
-                            "full_name": model,
-                            "type": "Ollama"
-                        })
-                except Exception as e:
-                    logger.warning(f"Failed to list models from {details['url']}: {e}")
+        # List Ollama models using REST API
+        for provider_name, provider_details in providers.items():
+            if provider_details["type"] == "ollama":
+                ollama_models = get_ollama_models(provider_name, provider_details["url"])
+                models.extend(ollama_models)
         
         # List OpenRouter models if requested
         if all_models:
