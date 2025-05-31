@@ -4,7 +4,6 @@ import json
 import time
 import uuid
 import logging
-import subprocess
 import argparse
 from pathlib import Path
 from threading import Thread, Lock
@@ -19,9 +18,162 @@ from sgpt.handlers.default_handler import DefaultHandler
 from sgpt.handlers.repl_handler import ReplHandler
 from sgpt.role import DefaultRoles, SystemRole
 from sgpt.function import get_openai_schemas
+from sgpt.model import BaseModelConfigManager
 
 # Global verbose flag
 VERBOSE_MODE = False
+
+# Initialize logger (will be properly configured in main())
+logger = logging.getLogger(__name__)
+
+class Server:
+    def __init__(self):
+        self.providers_config_path = Path.home() / ".config" / "shell_gpt" / "providers.json"
+        self.providers = self._load_providers_config()
+        self._models_lock = Lock()
+        self._models = []
+        self._update_models()
+        # Start background thread to update models periodically
+        self._models_updater_thread = Thread(target=self._models_updater, daemon=True)
+        self._models_updater_thread.start()
+
+    def _load_providers_config(self) -> dict:
+        """Load providers configuration from JSON file."""
+        if not self.providers_config_path.exists():
+            # Create default config if it doesn't exist
+            self.providers_config_path.parent.mkdir(parents=True, exist_ok=True)
+            default_config = {
+                "local": {
+                    "type": "ollama",
+                    "url": "http://localhost:11434"
+                }
+            }
+            with open(self.providers_config_path, 'w') as f:
+                json.dump(default_config, f, indent=2)
+            if VERBOSE_MODE:
+                logger.debug(f"Created default providers config at {self.providers_config_path}")
+            return default_config
+
+        with open(self.providers_config_path, 'r') as f:
+            config = json.load(f)
+            if VERBOSE_MODE:
+                logger.debug(f"Loaded providers config: {list(config.keys())}")
+            return config
+
+    def _list_endpoint_models(self, provider_name: str, url: str, key: str) -> list:
+        """Fetch models from a provider endpoint and extract using the given key."""
+        models = []
+        try:
+            if VERBOSE_MODE:
+                logger.debug(f"Fetching models from provider: {provider_name} at {url} (key: {key})")
+
+            response = requests.get(url, timeout=10)
+            response.raise_for_status()
+            data = response.json()
+
+            model_list = data.get(key, [])
+            if VERBOSE_MODE:
+                logger.debug(f"API response: {len(model_list)} models found for key '{key}'")
+
+            for model_info in model_list:
+                model_name = model_info.get('id', '') or model_info.get('name')
+                if model_name:
+                    full_name = f"{provider_name}/{model_name}"
+                    models.append({
+                        "provider": provider_name,
+                        "name": model_name,
+                        "type": model_info.get('type', provider_name),
+                        "size": model_info.get('size', 0),
+                        "modified_at": model_info.get('modified_at', ''),
+                        "digest": model_info.get('digest', ''),
+                        "details": model_info.get('details', {}),
+                    })
+                    if VERBOSE_MODE:
+                        logger.debug(f"Added model: {full_name}")
+
+        except requests.exceptions.RequestException as e:
+            logger.warning(f"Failed to fetch models from provider {provider_name} at {url}: {e}")
+        except Exception as e:
+            logger.warning(f"Error processing models from {provider_name}: {e}")
+
+        return models
+
+    def _list_ollama_models(self, provider_name: str, base_url: str) -> list:
+        """Get models from an Ollama provider using the REST API."""
+        return self._list_endpoint_models(provider_name, f"{base_url}/api/tags", "models")
+
+    def _list_openai_models(self, provider_name: str, base_url: str) -> list:
+        """Get models from an OpenAI-compatible provider using the REST API."""
+        return self._list_endpoint_models(provider_name, f"{base_url}/models", "data")
+
+    def _update_models(self):
+        """Fetch and update the cached list of models atomically."""
+        models = []
+        for provider_name, provider_details in self.providers.items():
+            if provider_details["type"] == "ollama":
+                ollama_models = self._list_ollama_models(provider_name, provider_details["url"])
+                models.extend(ollama_models)
+        # Optionally include all models (OpenRouter etc.)
+        for provider_name, provider_details in self.providers.items():
+            if provider_details["type"] in ("ollama", "openrouter"):
+                openai_models = self._list_openai_models(provider_name, provider_details["url"])
+                models.extend(openai_models)
+        with self._models_lock:
+            self._models = models
+        if VERBOSE_MODE:
+            logger.debug(f"Model cache updated: {len(models)} models")
+
+    def _models_updater(self):
+        """Background thread to periodically update the model cache."""
+        while True:
+            try:
+                self.providers = self._load_providers_config()
+                self._update_models()
+            except Exception as e:
+                logger.warning(f"Error updating model cache: {e}")
+            time.sleep(1800)  # Update every 30 minutes
+
+    def list_models(self, all_models=True):
+        """Return the cached list of models."""
+        with self._models_lock:
+            if all_models:
+                return list(self._models)
+            else:
+                return [m for m in self._models if m.get("type") == "ollama"]
+
+    def get_provider_details(self, provider):
+        """
+        Return (url, type) for the given provider name.
+        Raises ValueError if provider not found.
+        """
+        if provider not in self.providers:
+            raise ValueError(f"Provider '{provider}' not found in configuration")
+        provider_info = self.providers[provider]
+        return provider_info.get("url"), provider_info.get("type")
+
+class ServerModelConfigManager(BaseModelConfigManager):
+    """
+    Model config manager that uses a fixed config_path and server for list_models.
+    """
+
+    def __init__(self, server):
+        config_path = Path.home() / ".config" / "shell_gpt" / "sgpt.toml"
+        super().__init__(config_path)
+        self.server = server
+
+    def list_models(self, all_models=True):
+        """
+        List available models using the client.
+        Args:
+            all_models (bool): If False, fetch local models only.
+        Returns:
+            dict: Dictionary containing available models.
+        Do not cache the model list, always fetch from client
+        """
+        return self.server.list_models()
+
+server = Server()
+model_config_manager = ServerModelConfigManager(server)
 
 def setup_logging(verbose=False):
     """Configure logging based on verbose mode."""
@@ -91,9 +243,6 @@ def log_streaming_token(token, token_count=None):
     else:
         logger.debug(f"Streaming token: '{token[:50]}{'...' if len(token) > 50 else ''}'")
 
-# Initialize logger (will be properly configured in main())
-logger = logging.getLogger(__name__)
-
 app = Flask(__name__)
 CORS(app)  # Enable CORS for all routes
 
@@ -118,11 +267,66 @@ def create_role_from_content(role_content):
     class CustomRole:
         def __init__(self, content):
             self.content = content
+            self.role = content  # Add role attribute for compatibility with handlers
+            self.name = "CustomRole"  # Add name attribute
         
         def __str__(self):
             return self.content
+        
+        def get_role_name(self, initial_message: str):
+            """Get role name from initial message."""
+            if not initial_message:
+                return None
+            message_lines = initial_message.splitlines()
+            if "You are" in message_lines[0]:
+                return message_lines[0].split("You are ")[1].strip()
+            return None
+        
+        def same_role(self, initial_message: str) -> bool:
+            """Check if this role matches the initial message."""
+            if not initial_message:
+                return False
+            return True if f"You are {self.name}" in initial_message else False
     
     return CustomRole(role_content)
+
+def resolve_model_configuration(model_param):
+    """Resolve model configuration and configure ShellGPT appropriately."""
+    if model_param is None:
+        # Use default model from config
+        model_param = model_config_manager.get_default_model()
+        if VERBOSE_MODE:
+            logger.debug(f"Using default model: {model_param}")
+        return model_param
+    
+    if not model_config_manager.validate_model(model_param):
+        raise ValueError("Invalid model parameter format")
+    
+    provider = model_param['provider']
+    model_name = model_param['name']
+    model_type = model_param['type']
+    
+    if VERBOSE_MODE:
+        logger.debug(f"Resolving model - Provider: {provider}, Name: {model_name}, Type: {model_type}")
+    
+    if not model_config_manager.model_exists(model_param):
+        raise ValueError(f"Model '{model_name}' not found for provider '{provider}'")
+
+    # Configure ShellGPT for the selected model
+    try:
+        provider_url, provider_type = server.get_provider_details(provider)
+        success = load_model_config(model_name, provider, provider_url, provider_type)
+        if not success:
+            raise ValueError(f"Failed to configure model {model_name} for provider {provider}")
+        
+        if VERBOSE_MODE:
+            logger.debug(f"Successfully configured model: {model_name}")
+        
+        return model_name
+    except Exception as e:
+        if VERBOSE_MODE:
+            logger.error(f"Error configuring model: {e}")
+        raise ValueError(f"Error configuring model: {e}")
 
 @app.before_request
 def before_request():
@@ -156,7 +360,7 @@ def status():
     
     return jsonify(response)
 
-def create_streaming_handler(handler_class, role, md):
+def create_streaming_handler(handler_class, role, md, chat_id=None):
     """Create a custom handler that yields streaming tokens."""
     class StreamingHandler(handler_class):
         def handle_streaming(self, **kwargs):
@@ -197,7 +401,19 @@ def create_streaming_handler(handler_class, role, md):
             # Yield the final complete response as a special message
             yield f"\n__SGPT_COMPLETE__{full_response}__SGPT_COMPLETE__"
     
-    return StreamingHandler(role, md)
+    # Handle different constructor signatures
+    from sgpt.handlers.chat_handler import ChatHandler
+    from sgpt.handlers.repl_handler import ReplHandler
+    from sgpt.handlers.default_handler import DefaultHandler
+    
+    if issubclass(handler_class, ChatHandler):
+        # ChatHandler and ReplHandler need chat_id
+        if chat_id is None:
+            chat_id = "temp"  # Use temp as default
+        return StreamingHandler(chat_id, role, md)
+    else:
+        # DefaultHandler only needs role and markdown
+        return StreamingHandler(role, md)
 
 @app.route("/api/v1/completion", methods=["POST"])
 def completion():
@@ -206,7 +422,7 @@ def completion():
     log_request_details("COMPLETION", data)
     
     prompt = data.get("prompt", "")
-    model = data.get("model", cfg.get("DEFAULT_MODEL"))
+    model_param = data.get("model")
     temperature = data.get("temperature", 0.0)
     top_p = data.get("top_p", 1.0)
     md = data.get("md", cfg.get("PRETTIFY_MARKDOWN") == "true")
@@ -216,6 +432,27 @@ def completion():
     functions = data.get("functions", cfg.get("OPENAI_USE_FUNCTIONS") == "true")
     cache = data.get("cache", True)
     stream = data.get("stream", False)
+    
+    # Validate and resolve model configuration
+    try:
+        if model_param is not None and not model_config_manager.validate_model(model_param):
+            return jsonify({"error": "Invalid model parameter format. Expected dictionary with 'provider', 'name', and 'type' fields."}), 400
+        
+        # Verify model availability if specified
+        if model_param is not None and not model_config_manager.model_exists(model_param):
+            return jsonify({"error": f"Model '{model_param.get('name', 'unknown')}' not available from provider '{model_param.get('provider', 'unknown')}'"}), 400
+        
+        # Resolve the actual model name to use
+        model = resolve_model_configuration(model_param)
+        
+    except ValueError as e:
+        if VERBOSE_MODE:
+            logger.error(f"Model resolution error: {e}")
+        return jsonify({"error": str(e)}), 400
+    except Exception as e:
+        if VERBOSE_MODE:
+            logger.error(f"Unexpected error during model resolution: {e}")
+        return jsonify({"error": f"Error resolving model configuration: {e}"}), 500
     
     # Handle role - can be content string or None
     role_content = data.get("role")
@@ -227,7 +464,7 @@ def completion():
     function_schemas = (get_openai_schemas() or None) if functions else None
     
     if VERBOSE_MODE:
-        logger.debug(f"Completion parameters - Model: {model}, Temperature: {temperature}, "
+        logger.debug(f"Completion parameters - Model: {model}, Model param: {model_param}, Temperature: {temperature}, "
                     f"Top-p: {top_p}, Stream: {stream}, Role content: {role_content[:100] if role_content else 'Default'}")
         logger.debug(f"Function schemas enabled: {functions}, Cache: {cache}")
     
@@ -255,7 +492,7 @@ def completion():
                             logger.debug("Streaming completion finished")
                         log_completion_details(prompt, final_response, model, 
                                              temperature=temperature, top_p=top_p, cache=cache)
-                        yield f"event: complete\ndata: {json.dumps({'completion': final_response, 'model': model})}\n\n"
+                        yield f"event: complete\ndata: {json.dumps({'completion': final_response, 'model': model_param})}\n\n"
                     else:
                         yield f"data: {json.dumps({'token': token})}\n\n"
                 
@@ -282,7 +519,7 @@ def completion():
             
             response = {
                 "completion": full_completion,
-                "model": model,
+                "model": model_param,
             }
             
             if VERBOSE_MODE:
@@ -301,13 +538,34 @@ def chat():
     
     prompt = data.get("prompt", "")
     chat_id = data.get("chat_id")
-    model = data.get("model", cfg.get("DEFAULT_MODEL"))
+    model_param = data.get("model")
     temperature = data.get("temperature", 0.0)
     top_p = data.get("top_p", 1.0)
     md = data.get("md", cfg.get("PRETTIFY_MARKDOWN") == "true")
     functions = data.get("functions", cfg.get("OPENAI_USE_FUNCTIONS") == "true")
     cache = data.get("cache", True)
     stream = data.get("stream", False)
+    
+    # Validate and resolve model configuration
+    try:
+        if model_param is not None and not model_config_manager.validate_model(model_param):
+            return jsonify({"error": "Invalid model parameter format. Expected dictionary with 'provider', 'name', and 'type' fields."}), 400
+        
+        # Verify model availability if specified
+        if model_param is not None and not model_config_manager.model_exists(model_param):
+            return jsonify({"error": f"Model '{model_param.get('name', 'unknown')}' not available from provider '{model_param.get('provider', 'unknown')}'"}), 400
+        
+        # Resolve the actual model name to use
+        model = resolve_model_configuration(model_param)
+        
+    except ValueError as e:
+        if VERBOSE_MODE:
+            logger.error(f"Model resolution error: {e}")
+        return jsonify({"error": str(e)}), 400
+    except Exception as e:
+        if VERBOSE_MODE:
+            logger.error(f"Unexpected error during model resolution: {e}")
+        return jsonify({"error": f"Error resolving model configuration: {e}"}), 500
     
     # Handle role - can be content string or None
     role_content = data.get("role")
@@ -319,7 +577,7 @@ def chat():
     function_schemas = (get_openai_schemas() or None) if functions else None
     
     if VERBOSE_MODE:
-        logger.debug(f"Chat parameters - Chat ID: {chat_id}, Model: {model}, Stream: {stream}")
+        logger.debug(f"Chat parameters - Chat ID: {chat_id}, Model: {model}, Model param: {model_param}, Stream: {stream}")
         logger.debug(f"Role content: {role_content[:100] if role_content else 'Default'}")
     
     try:
@@ -329,8 +587,7 @@ def chat():
             
             # Return streaming response
             def generate():
-                handler = create_streaming_handler(ChatHandler, role_class, md)
-                handler.chat_id = chat_id  # Set chat_id for ChatHandler
+                handler = create_streaming_handler(ChatHandler, role_class, md, chat_id)
                 
                 for token in handler.handle_streaming(
                     prompt=prompt,
@@ -346,7 +603,7 @@ def chat():
                         # Extract final response and send completion event
                         final_response = token.replace("\n__SGPT_COMPLETE__", "").replace("__SGPT_COMPLETE__", "")
                         log_completion_details(prompt, final_response, model, chat_id=chat_id)
-                        yield f"event: complete\ndata: {json.dumps({'completion': final_response, 'chat_id': chat_id, 'model': model})}\n\n"
+                        yield f"event: complete\ndata: {json.dumps({'completion': final_response, 'chat_id': chat_id, 'model': model_param})}\n\n"
                     else:
                         yield f"data: {json.dumps({'token': token})}\n\n"
                 
@@ -373,7 +630,7 @@ def chat():
             return jsonify({
                 "completion": full_completion,
                 "chat_id": chat_id,
-                "model": model,
+                "model": model_param,
             })
     except Exception as e:
         logger.exception(f"Error generating chat completion: {e}")
@@ -393,13 +650,34 @@ def repl_start():
         logger.debug(f"Starting REPL session with ID: {repl_id}")
     
     init_prompt = data.get("prompt", "")
-    model = data.get("model", cfg.get("DEFAULT_MODEL"))
+    model_param = data.get("model")
     temperature = data.get("temperature", 0.0)
     top_p = data.get("top_p", 1.0)
     md = data.get("md", cfg.get("PRETTIFY_MARKDOWN") == "true")
     functions = data.get("functions", cfg.get("OPENAI_USE_FUNCTIONS") == "true")
     cache = data.get("cache", True)
     stream = data.get("stream", False)
+    
+    # Validate and resolve model configuration
+    try:
+        if model_param is not None and not model_config_manager.validate_model(model_param):
+            return jsonify({"error": "Invalid model parameter format. Expected dictionary with 'provider', 'name', and 'type' fields."}), 400
+        
+        # Verify model availability if specified
+        if model_param is not None and not model_config_manager.model_exists(model_param):
+            return jsonify({"error": f"Model '{model_param.get('name', 'unknown')}' not available from provider '{model_param.get('provider', 'unknown')}'"}), 400
+        
+        # Resolve the actual model name to use
+        model = resolve_model_configuration(model_param)
+        
+    except ValueError as e:
+        if VERBOSE_MODE:
+            logger.error(f"Model resolution error: {e}")
+        return jsonify({"error": str(e)}), 400
+    except Exception as e:
+        if VERBOSE_MODE:
+            logger.error(f"Unexpected error during model resolution: {e}")
+        return jsonify({"error": f"Error resolving model configuration: {e}"}), 500
     
     # Handle role - can be content string or None
     role_content = data.get("role")
@@ -418,6 +696,7 @@ def repl_start():
         repl_sessions[repl_id] = {
             "handler": repl_handler,
             "model": model,
+            "model_param": model_param,
             "temperature": temperature,
             "top_p": top_p,
             "cache": cache,
@@ -436,8 +715,7 @@ def repl_start():
         if stream:
             def generate():
                 try:
-                    streaming_handler = create_streaming_handler(ReplHandler, role_class, md)
-                    streaming_handler.chat_id = repl_id  # Set repl_id as chat_id
+                    streaming_handler = create_streaming_handler(ReplHandler, role_class, md, repl_id)
                     
                     for token in streaming_handler.handle_streaming(
                         prompt=init_prompt,
@@ -451,7 +729,7 @@ def repl_start():
                         if token.startswith("\n__SGPT_COMPLETE__"):
                             final_response = token.replace("\n__SGPT_COMPLETE__", "").replace("__SGPT_COMPLETE__", "")
                             log_completion_details(init_prompt, final_response, model, repl_id=repl_id)
-                            yield f"event: complete\ndata: {json.dumps({'repl_id': repl_id, 'response': final_response, 'model': model})}\n\n"
+                            yield f"event: complete\ndata: {json.dumps({'repl_id': repl_id, 'response': final_response, 'model': model_param})}\n\n"
                         else:
                             yield f"data: {json.dumps({'token': token})}\n\n"
                     
@@ -475,7 +753,7 @@ def repl_start():
                 return jsonify({
                     "repl_id": repl_id,
                     "response": response,
-                    "model": model,
+                    "model": model_param,
                 })
             except Exception as e:
                 logger.exception(f"Error processing initial REPL prompt: {e}")
@@ -484,7 +762,7 @@ def repl_start():
     return jsonify({
         "repl_id": repl_id,
         "response": None,
-        "model": model,
+        "model": model_param,
     })
 
 @app.route("/api/v1/repl/<repl_id>", methods=["POST"])
@@ -516,8 +794,7 @@ def repl_process(repl_id):
             def generate():
                 try:
                     repl_handler = session["handler"]
-                    streaming_handler = create_streaming_handler(ReplHandler, repl_handler.role, repl_handler.markdown)
-                    streaming_handler.chat_id = repl_id
+                    streaming_handler = create_streaming_handler(ReplHandler, repl_handler.role, repl_handler.markdown, repl_id)
                     
                     for token in streaming_handler.handle_streaming(
                         prompt=user_input,
@@ -607,119 +884,19 @@ def show_chat(chat_id):
         logger.exception(f"Error showing chat: {e}")
         return jsonify({"error": str(e)}), 500
 
-def get_providers_config_path() -> Path:
-    """Get the path to the providers configuration file."""
-    return Path.home() / ".config" / "shell_gpt" / "providers.json"
-
-def load_providers_config() -> dict:
-    """Load providers configuration from JSON file."""
-    providers_config_path = get_providers_config_path()
-    if not providers_config_path.exists():
-        # Create default config if it doesn't exist
-        providers_config_path.parent.mkdir(parents=True, exist_ok=True)
-        default_config = {
-            "local": {
-                "type": "ollama",
-                "url": "http://localhost:11434"
-            }
-        }
-        with open(providers_config_path, 'w') as f:
-            json.dump(default_config, f, indent=2)
-        
-        if VERBOSE_MODE:
-            logger.debug(f"Created default providers config at {providers_config_path}")
-        return default_config
-
-    with open(providers_config_path, 'r') as f:
-        config = json.load(f)
-        if VERBOSE_MODE:
-            logger.debug(f"Loaded providers config: {list(config.keys())}")
-        return config
-
-def get_ollama_models(provider_name: str, base_url: str) -> list:
-    """Get models from an Ollama provider using the REST API."""
-    models = []
-    try:
-        if VERBOSE_MODE:
-            logger.debug(f"Fetching models from Ollama provider: {provider_name} at {base_url}")
-
-        # Make request to the /api/tags endpoint
-        response = requests.get(f"{base_url}/api/tags", timeout=10)
-        response.raise_for_status()
-
-        data = response.json()
-
-        if VERBOSE_MODE:
-            logger.debug(f"Ollama API response: {len(data.get('models', []))} models found")
-
-        for model_info in data.get('models', []):
-            model_name = model_info.get('name', '')
-            if model_name:
-                full_name = f"{provider_name}/{model_name}"
-                models.append({
-                    "provider": provider_name,
-                    "name": model_name,
-                    "full_name": full_name,
-                    "type": "Ollama",
-                    "size": model_info.get('size', 0),
-                    "modified_at": model_info.get('modified_at', ''),
-                    "digest": model_info.get('digest', ''),
-                    "details": model_info.get('details', {})
-                })
-
-                if VERBOSE_MODE:
-                    logger.debug(f"Added Ollama model: {full_name}")
-
-    except requests.exceptions.RequestException as e:
-        logger.warning(f"Failed to fetch models from Ollama provider {provider_name} at {base_url}: {e}")
-    except Exception as e:
-        logger.warning(f"Error processing Ollama models from {provider_name}: {e}")
-
-    return models
-
 @app.route("/api/v1/models", methods=["GET"])
 def list_models():
     """List available models from all providers."""
     log_request_details("LIST_MODELS")
+
+    try:    
+        all_models = request.args.get("all", "false").lower() == "true"
     
-    all_models = request.args.get("all", "false").lower() == "true"
-    models = []
-    
-    if VERBOSE_MODE:
-        logger.debug(f"Listing models - include all: {all_models}")
-    
-    try:
-        providers = load_providers_config()
-        
-        # List Ollama models using REST API
-        for provider_name, provider_details in providers.items():
-            if provider_details["type"] == "ollama":
-                ollama_models = get_ollama_models(provider_name, provider_details["url"])
-                models.extend(ollama_models)
-        
-        # List OpenRouter models if requested
-        if all_models:
-            try:
-                if VERBOSE_MODE:
-                    logger.debug("Fetching OpenRouter models")
-                
-                response = requests.get('https://openrouter.ai/api/v1/models', timeout=10)
-                response.raise_for_status()
-                data = response.json()
-                
-                if VERBOSE_MODE:
-                    logger.debug(f"Found {len(data['data'])} OpenRouter models")
-                
-                for item in data['data']:
-                    models.append({
-                        "provider": "openrouter",
-                        "name": item['id'],
-                        "full_name": item['id'],
-                        "type": "OpenRouter"
-                    })
-            except Exception as e:
-                logger.warning(f"Failed to fetch OpenRouter models: {e}")
-        
+        if VERBOSE_MODE:
+            logger.debug(f"Listing models - include all: {all_models}")
+
+        models = server.list_models(all_models=all_models)
+
         if VERBOSE_MODE:
             logger.debug(f"Total models found: {len(models)}")
        
@@ -744,10 +921,10 @@ def get_openrouter_api_key() -> str:
         logger.error(f"Error reading OpenRouter API key: {e}")
         return ""
 
-def load_model_config(model: str, provider: str, url: str):
+def load_model_config(model: str, provider: str, url: str, provider_type: str):
     """Load model configuration into ShellGPT config."""
     if VERBOSE_MODE:
-        logger.debug(f"Loading model config - Model: {model}, Provider: {provider}, URL: {url}")
+        logger.debug(f"Loading model config - Model: {model}, Provider: {provider}, URL: {url}, Type: {provider_type}")
     
     # Base ShellGPT configuration
     sgptrc = {
@@ -772,7 +949,7 @@ def load_model_config(model: str, provider: str, url: str):
     }
 
     # Provider-specific configuration
-    if provider == 'ollama':
+    if provider_type == 'ollama':
         config = {**sgptrc, **{
             "API_BASE_URL": url,
             "USE_LITELLM": "true",
@@ -780,16 +957,16 @@ def load_model_config(model: str, provider: str, url: str):
         }}
         if VERBOSE_MODE:
             logger.debug("Configured for Ollama provider")
-    elif provider == 'openrouter':
+    elif provider_type in ['openai', 'openrouter']:
         config = {**sgptrc, **{
             "API_BASE_URL": url,
             "USE_LITELLM": "false",
             "OPENAI_API_KEY": get_openrouter_api_key()
         }}
         if VERBOSE_MODE:
-            logger.debug("Configured for OpenRouter provider")
+            logger.debug("Configured for OpenRouter/OpenAI provider")
     else:
-        logger.error(f"Unknown provider: {provider}")
+        logger.error(f"Unknown provider type: {provider_type}")
         return False
 
     # Set the model
@@ -809,152 +986,6 @@ def load_model_config(model: str, provider: str, url: str):
         logger.debug(f"Model configuration written to {config_path}")
 
     return True
-
-@app.route("/api/v1/models/load", methods=["POST"])
-def load_model():
-    """Load a specific model for use with ShellGPT."""
-    data = request.json
-    log_request_details("LOAD_MODEL", data)
-    
-    model_name = data.get("model")
-    
-    if not model_name:
-        return jsonify({"error": "Model name is required"}), 400
-    
-    if VERBOSE_MODE:
-        logger.debug(f"Attempting to load model: {model_name}")
-    
-    try:
-        providers = load_providers_config()
-        matched_models = {}
-        
-        # Try to find the model in Ollama providers
-        for provider, details in providers.items():
-            if details["type"] == "ollama":
-                try:
-                    if VERBOSE_MODE:
-                        logger.debug(f"Searching for model in Ollama provider: {provider}")
-                    
-                    # Set the OLLAMA_HOST environment variable for each provider
-                    env = os.environ.copy()
-                    env["OLLAMA_HOST"] = details["url"].split("//")[1]
-                    
-                    output = subprocess.check_output("ollama list", shell=True, env=env).decode()
-                    lines = output.split('\n')[1:]
-                    ollama_models = sorted([f"{provider}/{line.split()[0]}" for line in lines if line])
-                    
-                    for model in ollama_models:
-                        model_short = model.split('/', 1)[1]
-                        if (model_name in model) or (model_name in model_short):
-                            matched_models[model] = (provider, model_short, "ollama", details["url"])
-                            if VERBOSE_MODE:
-                                logger.debug(f"Found matching Ollama model: {model}")
-                except Exception as e:
-                    logger.warning(f"Failed to list models from {provider}: {e}")
-        
-        # If exactly one Ollama model matches, load it
-        if len(matched_models) == 1:
-            model_info = next(iter(matched_models.items()))
-            full_model_name = model_info[0]  # This is "provider/model:tag"
-            provider, model_short, model_type, url = model_info[1]
-            
-            if VERBOSE_MODE:
-                logger.debug(f"Loading single Ollama match: {full_model_name}")
-            
-            if load_model_config(full_model_name, model_type, url):
-                return jsonify({"status": "success", "model": full_model_name})
-            else:
-                return jsonify({"error": "Failed to load model configuration"}), 500
-        
-        # If no Ollama matches or multiple matches, try OpenRouter
-        if len(matched_models) == 0:
-            if VERBOSE_MODE:
-                logger.debug("No Ollama matches found, trying OpenRouter")
-            
-            try:
-                response = requests.get('https://openrouter.ai/api/v1/models', timeout=10)
-                response.raise_for_status()
-                data = response.json()
-                
-                openrouter_matches = []
-                for item in data['data']:
-                    if model_name in item['id']:
-                        openrouter_matches.append(item['id'])
-                
-                if VERBOSE_MODE:
-                    logger.debug(f"Found {len(openrouter_matches)} OpenRouter matches")
-                
-                # Check for exact match
-                if model_name in openrouter_matches:
-                    openrouter_matches = [model_name]
-                
-                if len(openrouter_matches) == 1:
-                    if VERBOSE_MODE:
-                        logger.debug(f"Loading OpenRouter model: {openrouter_matches[0]}")
-                    
-                    if load_model_config(openrouter_matches[0], "openrouter", "https://openrouter.ai/api/v1"):
-                        return jsonify({"status": "success", "model": openrouter_matches[0]})
-                    else:
-                        return jsonify({"error": "Failed to load model configuration"}), 500
-                elif len(openrouter_matches) > 1:
-                    return jsonify({
-                        "status": "error",
-                        "error": f"Multiple OpenRouter models match '{model_name}'",
-                        "matches": openrouter_matches[:10]
-                    }), 400
-            except Exception as e:
-                logger.warning(f"Failed to fetch OpenRouter models: {e}")
-        
-        # Handle multiple Ollama matches
-        if len(matched_models) > 1:
-            if VERBOSE_MODE:
-                logger.debug(f"Multiple Ollama matches found: {list(matched_models.keys())}")
-            
-            return jsonify({
-                "status": "error",
-                "error": f"Multiple models match '{model_name}'",
-                "matches": list(matched_models.keys())[:10]
-            }), 400
-        
-        # No matches found
-        if VERBOSE_MODE:
-            logger.debug(f"No models found matching: {model_name}")
-        
-        return jsonify({
-            "status": "error",
-            "error": f"No models match '{model_name}'"
-        }), 404
-    except Exception as e:
-        logger.exception(f"Error loading model: {e}")
-        return jsonify({"error": str(e)}), 500
-
-@app.route("/api/v1/model/current", methods=["GET"])
-def get_current_model():
-    """Get the currently configured model."""
-    log_request_details("GET_CURRENT_MODEL")
-    
-    config_path = Path.home() / ".config" / "shell_gpt" / ".sgptrc"
-    
-    if not config_path.exists():
-        if VERBOSE_MODE:
-            logger.debug("No configuration file found")
-        return jsonify({"error": "No configuration found"}), 404
-    
-    try:
-        with open(config_path, 'r') as file:
-            for line in file:
-                if line.startswith('DEFAULT_MODEL='):
-                    model = line.split('=', 1)[1].strip().strip('"')
-                    if VERBOSE_MODE:
-                        logger.debug(f"Current model: {model}")
-                    return jsonify({"model": model})
-        
-        if VERBOSE_MODE:
-            logger.debug("DEFAULT_MODEL not found in configuration")
-        return jsonify({"error": "DEFAULT_MODEL not found in configuration"}), 404
-    except Exception as e:
-        logger.exception(f"Error getting current model: {e}")
-        return jsonify({"error": str(e)}), 500
 
 def cleanup_inactive_sessions():
     """Clean up inactive REPL sessions."""
@@ -1105,3 +1136,10 @@ def main():
         logger.info("Server stopped by user")
     except Exception as e:
         logger.exception(f"Server error: {e}")
+
+import sys
+
+if __name__ == "__main__":
+    # For debugging: override sys.argv here if needed
+    sys.argv = ["sgpt_server", "--verbose"]
+    main()

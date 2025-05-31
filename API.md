@@ -7,6 +7,17 @@
 - **Authentication**: Optional `X-API-Key` header (currently accepts any value)
 - **CORS**: Enabled for all origins
 
+## Model Parameter Format
+
+The `model` parameter shall provide complete model specification with the following structure:
+  ```json
+  {
+    "provider": "string (provider name from providers.json)",
+    "name": "string (model name)",
+    "type": "string (model type: ollama, openrouter, etc.)"
+  }
+  ```
+
 ## Endpoints
 
 ### 1. Server Status
@@ -37,7 +48,7 @@ Generate a completion for a given prompt.
 ```json
 {
   "prompt": "string (required)",
-  "model": "string (optional, uses DEFAULT_MODEL if not specified)",
+  "model": "object (optional, uses DEFAULT_MODEL if not specified)",
   "temperature": 0.0,
   "top_p": 1.0,
   "md": true,
@@ -51,22 +62,40 @@ Generate a completion for a given prompt.
 }
 ```
 
+**Model Parameter Examples:**
+```json
+// Ollama provider
+"model": {
+  "provider": "local",
+  "name": "llama3.2:3b",
+  "type": "ollama"
+}
+
+// OpenRouter provider
+"model": {
+  "provider": "openrouter",
+  "name": "anthropic/claude-3-sonnet",
+  "type": "openrouter"
+}
+```
+
 **Response (Non-streaming):**
 ```json
 {
   "completion": "string",
-  "model": "string"
+  "model": "object"
 }
 ```
 
 **Response (Streaming):**
 - Content-Type: `text/event-stream`
 - Data events: `{"token": "string"}`
-- Complete event: `{"completion": "string", "model": "string"}`
+- Complete event: `{"completion": "string", "model": "object"}`
 - End event: `{}`
 
 **Error Responses:**
 - `401 Unauthorized`: Missing or invalid API key
+- `400 Bad Request`: Invalid model specification or provider not found
 - `500 Internal Server Error`: Error generating completion (model issues, configuration problems, etc.)
 
 ### 3. Chat Completion
@@ -80,7 +109,7 @@ Generate a chat completion with conversation history.
 {
   "prompt": "string (required)",
   "chat_id": "string (optional, for conversation continuity)",
-  "model": "string (optional)",
+  "model": "object (optional)",
   "temperature": 0.0,
   "top_p": 1.0,
   "md": true,
@@ -96,18 +125,19 @@ Generate a chat completion with conversation history.
 {
   "completion": "string",
   "chat_id": "string",
-  "model": "string"
+  "model": "object"
 }
 ```
 
 **Response (Streaming):**
 - Content-Type: `text/event-stream`
 - Data events: `{"token": "string"}`
-- Complete event: `{"completion": "string", "chat_id": "string", "model": "string"}`
+- Complete event: `{"completion": "string", "chat_id": "string", "model": "object"}`
 - End event: `{}`
 
 **Error Responses:**
 - `401 Unauthorized`: Missing or invalid API key
+- `400 Bad Request`: Invalid model specification or provider not found
 - `500 Internal Server Error`: Error generating chat completion (model issues, configuration problems, etc.)
 
 ### 4. REPL Session Management
@@ -123,7 +153,7 @@ Start a new REPL (Read-Eval-Print Loop) session.
 {
   "repl_id": "string (optional, auto-generated if not provided)",
   "prompt": "string (optional, initial prompt)",
-  "model": "string (optional)",
+  "model": "object (optional)",
   "temperature": 0.0,
   "top_p": 1.0,
   "md": true,
@@ -139,12 +169,13 @@ Start a new REPL (Read-Eval-Print Loop) session.
 {
   "repl_id": "string",
   "response": "string (null if no initial prompt)",
-  "model": "string"
+  "model": "object"
 }
 ```
 
 **Error Responses:**
 - `401 Unauthorized`: Missing or invalid API key
+- `400 Bad Request`: Invalid model specification or provider not found
 - `500 Internal Server Error`: Error processing initial REPL prompt (model issues, configuration problems, etc.)
 
 #### Process REPL Input
@@ -239,7 +270,7 @@ Retrieve all messages from a specific chat session.
 - `401 Unauthorized`: Missing or invalid API key
 - `500 Internal Server Error`: Error retrieving chat messages (invalid chat_id, storage issues, etc.)
 
-### 6. Model Management
+### 6. Model Listing
 
 #### List Available Models
 
@@ -257,7 +288,6 @@ List all available models from configured providers.
     {
       "provider": "string",
       "name": "string",
-      "full_name": "string",
       "type": "Ollama|OpenRouter"
     }
   ]
@@ -267,70 +297,6 @@ List all available models from configured providers.
 **Error Responses:**
 - `401 Unauthorized`: Missing or invalid API key
 - `500 Internal Server Error`: Error listing models (provider connection issues, configuration problems, etc.)
-
-#### Load Model
-
-**POST** `/api/v1/models/load`
-
-Load a specific model for use with ShellGPT.
-
-**Request Body:**
-```json
-{
-  "model": "string (required, model name or partial match)"
-}
-```
-
-**Response (Success):**
-```json
-{
-  "status": "success",
-  "model": "string"
-}
-```
-
-**Response (Multiple Matches):**
-```json
-{
-  "status": "error",
-  "error": "Multiple models match 'model_name'",
-  "matches": ["model1", "model2", "..."]
-}
-```
-
-**Response (No Matches):**
-```json
-{
-  "status": "error",
-  "error": "No models match 'model_name'"
-}
-```
-
-**Error Responses:**
-- `400 Bad Request`: Model name is required (missing "model" parameter)
-- `400 Bad Request`: Multiple models match the provided name (ambiguous model selection)
-- `401 Unauthorized`: Missing or invalid API key
-- `404 Not Found`: No models match the provided name
-- `500 Internal Server Error`: Failed to load model configuration (file system issues, provider problems, etc.)
-
-#### Get Current Model
-
-**GET** `/api/v1/model/current`
-
-Get the currently configured model.
-
-**Response:**
-```json
-{
-  "model": "string"
-}
-```
-
-**Error Responses:**
-- `401 Unauthorized`: Missing or invalid API key
-- `404 Not Found`: No configuration found (missing .sgptrc file)
-- `404 Not Found`: DEFAULT_MODEL not found in configuration file
-- `500 Internal Server Error`: Error reading configuration file (file system issues, permission problems, etc.)
 
 ## General Error Response Format
 
@@ -352,12 +318,24 @@ Streaming endpoints use Server-Sent Events (SSE) format:
 - **End Event**: `event: end\ndata: {}\n\n`
 - **Error Event**: `event: error\ndata: {"error": "string"}\n\n`
 
+## Model Resolution
+
+The server performs the following resolution of model dictionary parameter:
+
+1. **Provider Lookup**: Checks if the specified provider exists in `providers.json`
+2. **Model Validation**: Verifies that the model name is available from the specified provider
+3. **Configuration**: Sets up the appropriate API endpoints and authentication for the provider type
+4. **Fallback**: If the model dictionary is invalid, falls back to the DEFAULT_MODEL from configuration
+
+**Provider Types:**
+- `ollama`: Local Ollama instance
+- `openrouter`: OpenRouter API service
+
 ## Configuration
 
 The server loads configuration from:
 - `~/.config/shell_gpt/.sgptrc` - ShellGPT configuration
 - `~/.config/shell_gpt/providers.json` - Provider configuration
-- `~/.openrouter/key` - OpenRouter API key
 
 ## Session Management
 
