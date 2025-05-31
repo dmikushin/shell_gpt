@@ -109,6 +109,21 @@ def authenticate():
         logger.debug(f"Authentication check - API key present: {'Yes' if api_key else 'No'}")
     return True
 
+def create_role_from_content(role_content):
+    """Create a role object from role content string."""
+    if not role_content:
+        return DefaultRoles.DEFAULT.get_role()
+    
+    # Create a simple role object that can be used by handlers
+    class CustomRole:
+        def __init__(self, content):
+            self.content = content
+        
+        def __str__(self):
+            return self.content
+    
+    return CustomRole(role_content)
+
 @app.before_request
 def before_request():
     """Check authentication before processing request."""
@@ -141,7 +156,7 @@ def status():
     
     return jsonify(response)
 
-def create_streaming_handler(handler_class, role_class, md):
+def create_streaming_handler(handler_class, role, md):
     """Create a custom handler that yields streaming tokens."""
     class StreamingHandler(handler_class):
         def handle_streaming(self, **kwargs):
@@ -182,7 +197,7 @@ def create_streaming_handler(handler_class, role_class, md):
             # Yield the final complete response as a special message
             yield f"\n__SGPT_COMPLETE__{full_response}__SGPT_COMPLETE__"
     
-    return StreamingHandler(role_class, md)
+    return StreamingHandler(role, md)
 
 @app.route("/api/v1/completion", methods=["POST"])
 def completion():
@@ -202,18 +217,18 @@ def completion():
     cache = data.get("cache", True)
     stream = data.get("stream", False)
     
-    role_name = data.get("role")
-    role_class = (
-        DefaultRoles.check_get(shell, describe_shell, code)
-        if not role_name
-        else SystemRole.get(role_name)
-    )
+    # Handle role - can be content string or None
+    role_content = data.get("role")
+    if role_content:
+        role_class = create_role_from_content(role_content)
+    else:
+        role_class = DefaultRoles.check_get(shell, describe_shell, code)
     
     function_schemas = (get_openai_schemas() or None) if functions else None
     
     if VERBOSE_MODE:
         logger.debug(f"Completion parameters - Model: {model}, Temperature: {temperature}, "
-                    f"Top-p: {top_p}, Stream: {stream}, Role: {role_name}")
+                    f"Top-p: {top_p}, Stream: {stream}, Role content: {role_content[:100] if role_content else 'Default'}")
         logger.debug(f"Function schemas enabled: {functions}, Cache: {cache}")
     
     try:
@@ -240,7 +255,7 @@ def completion():
                             logger.debug("Streaming completion finished")
                         log_completion_details(prompt, final_response, model, 
                                              temperature=temperature, top_p=top_p, cache=cache)
-                        yield f"event: complete\ndata: {json.dumps({'completion': final_response, 'model': model, 'role': role_name})}\n\n"
+                        yield f"event: complete\ndata: {json.dumps({'completion': final_response, 'model': model})}\n\n"
                     else:
                         yield f"data: {json.dumps({'token': token})}\n\n"
                 
@@ -268,7 +283,6 @@ def completion():
             response = {
                 "completion": full_completion,
                 "model": model,
-                "role": role_name,
             }
             
             if VERBOSE_MODE:
@@ -295,13 +309,18 @@ def chat():
     cache = data.get("cache", True)
     stream = data.get("stream", False)
     
-    role_name = data.get("role")
-    role_class = DefaultRoles.DEFAULT.get_role() if not role_name else SystemRole.get(role_name)
+    # Handle role - can be content string or None
+    role_content = data.get("role")
+    if role_content:
+        role_class = create_role_from_content(role_content)
+    else:
+        role_class = DefaultRoles.DEFAULT.get_role()
     
     function_schemas = (get_openai_schemas() or None) if functions else None
     
     if VERBOSE_MODE:
         logger.debug(f"Chat parameters - Chat ID: {chat_id}, Model: {model}, Stream: {stream}")
+        logger.debug(f"Role content: {role_content[:100] if role_content else 'Default'}")
     
     try:
         if stream:
@@ -327,7 +346,7 @@ def chat():
                         # Extract final response and send completion event
                         final_response = token.replace("\n__SGPT_COMPLETE__", "").replace("__SGPT_COMPLETE__", "")
                         log_completion_details(prompt, final_response, model, chat_id=chat_id)
-                        yield f"event: complete\ndata: {json.dumps({'completion': final_response, 'chat_id': chat_id, 'model': model, 'role': role_name})}\n\n"
+                        yield f"event: complete\ndata: {json.dumps({'completion': final_response, 'chat_id': chat_id, 'model': model})}\n\n"
                     else:
                         yield f"data: {json.dumps({'token': token})}\n\n"
                 
@@ -355,7 +374,6 @@ def chat():
                 "completion": full_completion,
                 "chat_id": chat_id,
                 "model": model,
-                "role": role_name,
             })
     except Exception as e:
         logger.exception(f"Error generating chat completion: {e}")
@@ -383,8 +401,12 @@ def repl_start():
     cache = data.get("cache", True)
     stream = data.get("stream", False)
     
-    role_name = data.get("role")
-    role_class = DefaultRoles.DEFAULT.get_role() if not role_name else SystemRole.get(role_name)
+    # Handle role - can be content string or None
+    role_content = data.get("role")
+    if role_content:
+        role_class = create_role_from_content(role_content)
+    else:
+        role_class = DefaultRoles.DEFAULT.get_role()
     
     function_schemas = (get_openai_schemas() or None) if functions else None
     
@@ -583,32 +605,6 @@ def show_chat(chat_id):
         return jsonify({"chat_id": chat_id, "messages": messages})
     except Exception as e:
         logger.exception(f"Error showing chat: {e}")
-        return jsonify({"error": str(e)}), 500
-
-@app.route("/api/v1/roles", methods=["GET"])
-def list_roles():
-    """List all available roles."""
-    log_request_details("LIST_ROLES")
-    
-    try:
-        roles = SystemRole.list(standalone=True)
-        if VERBOSE_MODE:
-            logger.debug(f"Found {len(roles)} roles")
-        return jsonify({"roles": roles})
-    except Exception as e:
-        logger.exception(f"Error listing roles: {e}")
-        return jsonify({"error": str(e)}), 500
-
-@app.route("/api/v1/roles/<role_name>", methods=["GET"])
-def show_role(role_name):
-    """Show a specific role."""
-    log_request_details(f"SHOW_ROLE/{role_name}")
-    
-    try:
-        role = SystemRole.show(role_name, standalone=True)
-        return jsonify({"role": role})
-    except Exception as e:
-        logger.exception(f"Error showing role: {e}")
         return jsonify({"error": str(e)}), 500
 
 def get_providers_config_path() -> Path:
@@ -978,7 +974,7 @@ def process_single_input(self, prompt, model, temperature, top_p, caching, funct
     
     # Add system role if specified
     if self.role_class:
-        messages.append({"role": "system", "content": self.role_class})
+        messages.append({"role": "system", "content": str(self.role_class)})
     
     # Add conversation history
     messages.extend(self.history)

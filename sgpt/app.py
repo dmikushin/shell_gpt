@@ -53,6 +53,148 @@ def check_server_status():
     except Exception:
         return False
 
+def get_roles_dir():
+    """Get the roles directory path."""
+    roles_dir = Path.home() / ".config" / "shell_gpt" / "roles"
+    roles_dir.mkdir(parents=True, exist_ok=True)
+    return roles_dir
+
+def create_role(role_name, description):
+    """Create a new role on the client side."""
+    roles_dir = get_roles_dir()
+    role_file = roles_dir / f"{role_name}.json"
+    
+    if role_file.exists():
+        console.print(f"[red]Role '{role_name}' already exists.[/red]")
+        return False
+    
+    role_data = {
+        "name": role_name,
+        "description": description,
+        "created_at": str(Path.ctime(Path.now()) if hasattr(Path, 'now') else "unknown")
+    }
+    
+    try:
+        with open(role_file, 'w') as f:
+            json.dump(role_data, f, indent=2)
+        console.print(f"[green]Role '{role_name}' created successfully.[/green]")
+        return True
+    except Exception as e:
+        console.print(f"[red]Error creating role: {e}[/red]")
+        return False
+
+def list_roles():
+    """List all available roles on the client side."""
+    roles_dir = get_roles_dir()
+    
+    # Built-in roles
+    builtin_roles = ["default", "shell", "code", "describe_shell"]
+    
+    # Custom roles from files
+    custom_roles = []
+    for role_file in roles_dir.glob("*.json"):
+        custom_roles.append(role_file.stem)
+    
+    console.print("[bold]Built-in roles:[/bold]")
+    for role in builtin_roles:
+        console.print(f"  {role}")
+    
+    if custom_roles:
+        console.print("\n[bold]Custom roles:[/bold]")
+        for role in sorted(custom_roles):
+            console.print(f"  {role}")
+    else:
+        console.print("\n[dim]No custom roles found.[/dim]")
+
+def show_role(role_name):
+    """Show details of a specific role."""
+    # Check built-in roles first
+    builtin_descriptions = {
+        "default": "Default role for general conversation",
+        "shell": "Role for generating shell commands",
+        "code": "Role for generating code",
+        "describe_shell": "Role for describing shell commands"
+    }
+    
+    if role_name in builtin_descriptions:
+        console.print(f"[bold]Role: {role_name}[/bold]")
+        console.print(f"Type: Built-in")
+        console.print(f"Description: {builtin_descriptions[role_name]}")
+        return
+    
+    # Check custom roles
+    roles_dir = get_roles_dir()
+    role_file = roles_dir / f"{role_name}.json"
+    
+    if not role_file.exists():
+        console.print(f"[red]Role '{role_name}' not found.[/red]")
+        return
+    
+    try:
+        with open(role_file, 'r') as f:
+            role_data = json.load(f)
+        
+        console.print(f"[bold]Role: {role_name}[/bold]")
+        console.print(f"Type: Custom")
+        console.print(f"Description: {role_data.get('description', 'No description')}")
+        if 'created_at' in role_data:
+            console.print(f"Created: {role_data['created_at']}")
+    except Exception as e:
+        console.print(f"[red]Error reading role: {e}[/red]")
+
+def delete_role(role_name):
+    """Delete a custom role."""
+    # Prevent deletion of built-in roles
+    builtin_roles = ["default", "shell", "code", "describe_shell"]
+    if role_name in builtin_roles:
+        console.print(f"[red]Cannot delete built-in role '{role_name}'.[/red]")
+        return False
+    
+    roles_dir = get_roles_dir()
+    role_file = roles_dir / f"{role_name}.json"
+    
+    if not role_file.exists():
+        console.print(f"[red]Role '{role_name}' not found.[/red]")
+        return False
+    
+    try:
+        role_file.unlink()
+        console.print(f"[green]Role '{role_name}' deleted successfully.[/green]")
+        return True
+    except Exception as e:
+        console.print(f"[red]Error deleting role: {e}[/red]")
+        return False
+
+def get_role_content(role_name):
+    """Get the content/description of a role to send to server."""
+    if not role_name:
+        return None
+    
+    # Built-in roles
+    builtin_roles = {
+        "default": "You are ShellGPT, a helpful AI assistant.",
+        "shell": "You are ShellGPT, an AI assistant that generates shell commands. Provide only the command without explanation unless asked.",
+        "code": "You are ShellGPT, an AI assistant that generates code. Provide only clean, executable code without explanations unless asked.",
+        "describe_shell": "You are ShellGPT, an AI assistant that explains shell commands in detail."
+    }
+    
+    if role_name in builtin_roles:
+        return builtin_roles[role_name]
+    
+    # Custom roles
+    roles_dir = get_roles_dir()
+    role_file = roles_dir / f"{role_name}.json"
+    
+    if role_file.exists():
+        try:
+            with open(role_file, 'r') as f:
+                role_data = json.load(f)
+            return role_data.get('description', '')
+        except Exception:
+            return None
+    
+    return None
+
 def stream_response(response, md=False):
     """Handle streaming response with Rich Live display."""
     accumulated_text = ""
@@ -176,6 +318,7 @@ def create_parser():
     role_group = parser.add_argument_group('role options')
     role_group.add_argument('--role', help='System role for GPT model')
     role_group.add_argument('--create-role', help='Create role')
+    role_group.add_argument('--delete-role', help='Delete role')
     role_group.add_argument('--show-role', help='Show role')
     role_group.add_argument('-lr', '--list-roles', action='store_true', help='List roles')
     
@@ -349,6 +492,24 @@ def main():
         install_shell_integration()
         return
     
+    # Handle client-side role operations (no server required)
+    if args.create_role:
+        role_description = input("Enter role description: ")
+        create_role(args.create_role, role_description)
+        return
+    
+    if args.delete_role:
+        delete_role(args.delete_role)
+        return
+    
+    if args.show_role:
+        show_role(args.show_role)
+        return
+    
+    if args.list_roles:
+        list_roles()
+        return
+    
     # Validate arguments
     validate_args(args)
     
@@ -426,39 +587,12 @@ def main():
             console.print(f"[red]Error: {str(e)}[/red]")
             return
     
-    if args.list_roles:
-        try:
-            response = requests.get(
-                f"{SERVER_URL}/api/v1/roles",
-                headers=get_api_headers(),
-                timeout=30
-            )
-            response.raise_for_status()
-            data = response.json()
-            
-            console.print("[bold]Available roles:[/bold]")
-            for role_name in data.get("roles", []):
-                console.print(f"  {role_name}")
-            
-            return
-        except Exception as e:
-            console.print(f"[red]Error: {str(e)}[/red]")
-            return
-    
-    if args.create_role:
-        role_description = input("Enter role description: ")
-        # Here you would implement role creation
-        console.print(f"[green]Role '{args.create_role}' created successfully.[/green]")
-        return
-    
-    if args.show_role:
-        # Here you would implement role display
-        console.print(f"[bold]Role: {args.show_role}[/bold]")
-        return
-    
     # Handle editor input
     if args.editor:
         prompt = get_edited_prompt()
+    
+    # Get role content to send to server
+    role_content = get_role_content(args.role)
     
     # Process REPL command
     if args.repl:
@@ -475,7 +609,7 @@ def main():
                     "md": args.md,
                     "cache": args.cache,
                     "functions": args.functions,
-                    "role": args.role,
+                    "role": role_content,
                     "stream": args.stream
                 },
                 headers=get_api_headers(),
@@ -557,7 +691,7 @@ def main():
                     "md": args.md,
                     "cache": args.cache,
                     "functions": args.functions,
-                    "role": args.role,
+                    "role": role_content,
                     "stream": args.stream
                 },
                 headers=get_api_headers(),
@@ -593,7 +727,7 @@ def main():
                 "code": args.code,
                 "functions": args.functions,
                 "cache": args.cache,
-                "role": args.role,
+                "role": role_content,
                 "stream": args.stream
             },
             headers=get_api_headers(),
@@ -629,7 +763,7 @@ def main():
                             "md": args.md,
                             "describe_shell": True,
                             "cache": args.cache,
-                            "role": "describe_shell",
+                            "role": get_role_content("describe_shell"),
                             "stream": args.stream
                         },
                         headers=get_api_headers(),
@@ -661,6 +795,3 @@ def entry_point():
     except Exception as e:
         console.print(f"[red]Unexpected error: {str(e)}[/red]")
         sys.exit(1)
-
-if __name__ == "__main__":
-    entry_point()
